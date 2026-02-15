@@ -56,7 +56,7 @@ echo.
 REM === Launch Server ===
 echo [3/3] Starting TCP server...
 echo.
-%LUA_EXE% server.lua
+%LUA_EXE% server_tcp.lua
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
