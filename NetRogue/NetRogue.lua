@@ -47,37 +47,38 @@ function UpdateUI(mx, my, down, w, h)
     Particles.update(dt)
     MessageLog.update(dt)
 
-    -- State machine
-    if GameState.state == "connecting" then
-        Network.updateConnecting(dt)
+-- State machine
+if GameState.state == "connecting" then
+    Network.updateConnecting(dt)
+    
+    -- OFFLINE MODE SHORTCUT
+    if Network.OFFLINE_MODE and Network.connected then
+        GameState.state = "playing"
         
-        -- OFFLINE MODE: Immediately transition to playing
-        if Network.OFFLINE_MODE and Network.connected then
-            GameState.state = "playing"
+        -- Initialize local game FIRST
+        if LocalGame and not LocalGame.initialized then
+            LocalGame.init()
             
-            -- Initialize local game FIRST
-            if LocalGame and not LocalGame.initialized then
-                LocalGame.init()
-                
-                -- Set player starting position
-                if #MapGen.rooms > 0 then
-                    Entities.player.x = MapGen.rooms[1].cx
-                    Entities.player.y = MapGen.rooms[1].cy
-                end
+            -- Set player starting position
+            if #MapGen.rooms > 0 then
+                Entities.player.x = MapGen.rooms[1].cx
+                Entities.player.y = MapGen.rooms[1].cy
             end
-            
-            -- THEN compute FOV
-            local FOV = require("fov")
-            FOV.compute()
-            
-            MessageLog.add("OFFLINE MODE - Local singleplayer", Config.C.net_wait)
         end
         
-        if Network.connected and not Network.OFFLINE_MODE then
-            Messages.processServerMessages()
-        end
-        return
+        -- THEN compute FOV
+        local FOV = require("fov")
+        FOV.compute()
+        
+        MessageLog.add("OFFLINE MODE - Local singleplayer", Config.C.net_wait)
     end
+    
+    -- ONLINE MODE: Always process server messages while connecting
+    if not Network.OFFLINE_MODE then
+        Messages.processServerMessages()
+    end
+    return
+end
 
     if GameState.state == "disconnected" then
         if Input.keyPressed("space") then

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Project Bridge</title>
+    <title>NetRogue</title>
     <style>
         * {
             margin: 0;
@@ -31,6 +31,108 @@
     <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="1"></canvas>
     
     <script type="text/javascript">
+        // ============================================================
+        // WEBSOCKET BRIDGE FOR NETROGUE
+        // ============================================================
+        let ws = null;
+        let wsConnected = false;
+        let messageQueue = [];
+        let wsMessageBuffer = "";
+        
+window.wsConnect = function(url) {
+    console.log('[WebSocket] Connecting to:', url);
+    try {
+        ws = new WebSocket(url);
+        
+        // Keep connection alive
+        let pingInterval = null;
+        
+        ws.onopen = function() {
+            console.log('[WebSocket] Connected!');
+            wsConnected = true;
+            
+            // Send ping every 5 seconds to keep connection alive
+            pingInterval = setInterval(function() {
+                if (ws && wsConnected && ws.readyState === WebSocket.OPEN) {
+                    // WebSocket ping is automatic, just check state
+                }
+            }, 5000);
+        };
+        
+        ws.onmessage = function(event) {
+            if (event.data instanceof Blob) {
+                const reader = new FileReader();
+                reader.onload = function() {
+                    const text = reader.result;
+                    console.log('[WebSocket] Received (from Blob):', text);
+                    messageQueue.push(text);
+                };
+                reader.readAsText(event.data);
+            } else {
+                console.log('[WebSocket] Received:', event.data);
+                messageQueue.push(event.data);
+            }
+        };
+        
+        ws.onerror = function(error) {
+            console.error('[WebSocket] Error:', error);
+            wsConnected = false;
+            if (pingInterval) clearInterval(pingInterval);
+        };
+        
+        ws.onclose = function() {
+            console.log('[WebSocket] Closed');
+            wsConnected = false;
+            if (pingInterval) clearInterval(pingInterval);
+        };
+        
+        return 1;
+    } catch (e) {
+        console.error('[WebSocket] Connection failed:', e);
+        return 0;
+    }
+};
+        
+        window.wsIsConnected = function() {
+            return wsConnected ? 1 : 0;
+        };
+        
+        window.wsGetMessage = function() {
+            if (messageQueue.length > 0) {
+                const message = messageQueue.shift();
+                wsMessageBuffer += message;
+                
+                const newlineIndex = wsMessageBuffer.indexOf('\n');
+                if (newlineIndex !== -1) {
+                    const line = wsMessageBuffer.substring(0, newlineIndex);
+                    wsMessageBuffer = wsMessageBuffer.substring(newlineIndex + 1);
+                    return line;
+                }
+            }
+            return "";
+        };
+        
+       window.wsSendMessage = function(message) {
+    if (ws && wsConnected) {
+        try {
+            console.log('[WebSocket] Sending:', message);
+            // Convert string to Uint8Array and send as binary
+            const encoder = new TextEncoder();
+            const data = encoder.encode(message + '\n');
+            ws.send(data.buffer);
+            return 1;
+        } catch (e) {
+            console.error('[WebSocket] Send failed:', e);
+            wsConnected = false;
+            return 0;
+        }
+    }
+    return 0;
+};
+        
+        // ============================================================
+        // EMSCRIPTEN MODULE CONFIGURATION
+        // ============================================================
         var Module = {
             canvas: document.getElementById('canvas'),
             print: function(text) {

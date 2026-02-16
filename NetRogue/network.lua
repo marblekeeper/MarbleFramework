@@ -60,7 +60,6 @@ if IS_WASM then
         end
         
         -- Call JavaScript to initiate WebSocket connection
-        -- This assumes window.wsConnect exists in the HTML page
         local wsUrl = "ws://localhost:8080"  -- websockify proxy
         bridge.callJS("wsConnect('" .. wsUrl .. "')")
         
@@ -101,22 +100,8 @@ if IS_WASM then
             return nil
         end
         
-        -- Append to buffer
-        Network.recv_buffer = Network.recv_buffer .. data
-        
-        -- Parse line-delimited messages
-        local lines = {}
-        while true do
-            local pos = Network.recv_buffer:find("\n")
-            if not pos then break end
-            local line = Network.recv_buffer:sub(1, pos - 1)
-            Network.recv_buffer = Network.recv_buffer:sub(pos + 1)
-            if #line > 0 then
-                table.insert(lines, line)
-            end
-        end
-        
-        return #lines > 0 and lines or nil
+        -- Return as single-item array (messagehandler expects array)
+        return {data}
     end
     
     function Network.updateConnecting(dt)
@@ -233,7 +218,7 @@ else
             end
         end
         
-        return lines
+        return #lines > 0 and lines or nil
     end
     
     function Network.updateConnecting(dt)

@@ -1,4 +1,4 @@
--- netrogue/protocol.lua
+-- netrogue/messagehandler.lua
 -- Server message processing and protocol handling
 
 local Network = require("network")
@@ -12,27 +12,24 @@ local FOV = require("fov")
 
 local ProtocolModule = require("protocol")
 
-local Protocol = {}
+local Messages = {}
 
-function Protocol.processServerMessages()
-    -- Early return in offline mode (WASM doesn't have network)
-    if Network.OFFLINE_MODE then
-        return
-    end
-    
-    if not Network.connected or not Network.client then return end
+function Messages.processServerMessages()
+    if not Network.connected or (not Network.client and not Network.IS_WASM) then return end
 
     local lines = Network.receive()
     if not lines then return end
 
     for _, data in ipairs(lines) do
-        Protocol.handleMessage(data)
+        Messages.handleMessage(data)
     end
 end
 
-function Protocol.handleMessage(data)
+function Messages.handleMessage(data)
     local C = Config.C
     local TS = Config.TS
+    
+    print("[Messages] Processing: " .. data)
     
     -- AUTH:OK with map seed
     if data:match("^" .. ProtocolModule.RESPONSE.AUTH_OK) then
@@ -42,7 +39,10 @@ function Protocol.handleMessage(data)
         Network.player_id = Entities.player.id
         Entities.player.connected = true
         Entities.player.dead = false
+        
+        -- CRITICAL: Transition to playing state
         GameState.state = "playing"
+        
         Network.status_msg = "Player #" .. Entities.player.id
 
         -- Generate map from server seed (deterministic!)
@@ -59,6 +59,8 @@ function Protocol.handleMessage(data)
         MessageLog.add("WASD: move (bump goblins to fight!)", {160, 150, 180})
         MessageLog.add("Watch out — goblins hit back.", {200, 120, 100})
         FOV.compute()
+        
+        print("[Messages] AUTH:OK processed - GameState = " .. GameState.state)
 
     -- INTENT_ACK
     elseif data:match("^" .. ProtocolModule.RESPONSE.INTENT_ACK) then
@@ -246,8 +248,8 @@ function Protocol.handleMessage(data)
         MessageLog.add("Server: " .. errMsg, C.net_err)
 
     else
-        print("[NetRogue] Unknown: " .. data)
+        print("[Messages] Unknown: " .. data)
     end
 end
 
-return Protocol
+return Messages
