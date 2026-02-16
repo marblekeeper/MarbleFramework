@@ -716,7 +716,7 @@ int main(int argc, char** argv) {
     }
 
     int winW = 1024, winH = 768;
-    SDL_Window* window = SDL_CreateWindow("Project Bridge Lua UI", 
+    SDL_Window* window = SDL_CreateWindow("Marble Engine", 
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
         winW, winH, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     
@@ -758,110 +758,99 @@ int main(int argc, char** argv) {
     lua_pushcfunction(L, l_bridge_callJS); lua_setfield(L, -2, "callJS"); // NEW: JavaScript interop
     lua_setglobal(L, "bridge");
 
-    const char* scriptName = (argc > 1) ? argv[1] : "ohko";
-    char scriptPath[256];
+    // Accept full relative path: "MindMarr/MindMarr" or "scripts/demos/ohko"
+    const char* scriptPath = (argc > 1) ? argv[1] : "netrogue/netrogue";
+    char fullScriptPath[512];
+    char scriptDir[512];
     char frameworkPath[256];
 
 #ifdef __EMSCRIPTEN__
     // Emscripten uses absolute paths in virtual filesystem
     strcpy(frameworkPath, "/scripts/core/framework.lua");
+    // Convert scriptPath to lowercase to match preload mapping
+    char wasmScriptPath[512];
+    strncpy(wasmScriptPath, scriptPath, sizeof(wasmScriptPath) - 1);
+    wasmScriptPath[sizeof(wasmScriptPath) - 1] = '\0';
+    for (char* p = wasmScriptPath; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = *p + ('a' - 'A');
+        }
+    }
+    snprintf(fullScriptPath, sizeof(fullScriptPath), "/%s.lua", wasmScriptPath);
 #else
     // Native uses relative paths
     strcpy(frameworkPath, "scripts/core/framework.lua");
+    snprintf(fullScriptPath, sizeof(fullScriptPath), "%s.lua", scriptPath);
 #endif
 
-// Set up package paths FIRST
-    if (strcmp(scriptName, "MindMarr") == 0) {
-        lua_getglobal(L, "package");
-        lua_getfield(L, -1, "path");
-        const char* currentPath = lua_tostring(L, -1);
-        char newPath[1024];
-#ifdef __EMSCRIPTEN__
-        snprintf(newPath, sizeof(newPath), "%s;/MindMarr/?.lua;/scripts/core/?.lua", currentPath);
-        sprintf(scriptPath, "/MindMarr/MindMarr.lua");
-#else
-        snprintf(newPath, sizeof(newPath), "%s;MindMarr/?.lua;scripts/core/?.lua", currentPath);
-        sprintf(scriptPath, "MindMarr/MindMarr.lua");
-#endif
-        lua_pop(L, 1);
-        lua_pushstring(L, newPath);
-        lua_setfield(L, -2, "path");
-        lua_pop(L, 1);
-        
-        printf("[System] Lua package.path set for MindMarr\n");
-
-    } else if (strcmp(scriptName, "NetRogue") == 0) {
-        // NetRogue: ClayMarble renderer + MarbleNet TCP protocol
-        // Needs: NetRogue/ folder, project root (protocol.lua), and LuaSocket
-
-        // Set package.path: NetRogue folder + project root + core scripts
-        lua_getglobal(L, "package");
-        lua_getfield(L, -1, "path");
-        const char* currentPath = lua_tostring(L, -1);
-        char newPath[2048];
-#ifdef __EMSCRIPTEN__
-        snprintf(newPath, sizeof(newPath),
-            "%s;/NetRogue/?.lua;/scripts/core/?.lua;/?.lua",
-            currentPath);
-        sprintf(scriptPath, "/NetRogue/NetRogue.lua");
-#else
-        // Add: NetRogue/, project root, scripts/core, and MSYS2 luarocks paths
-        snprintf(newPath, sizeof(newPath),
-            "%s"
-            ";NetRogue/?.lua"
-            ";scripts/core/?.lua"
-            ";./?.lua"
-            ";C:/msys64/ucrt64/share/lua/5.4/?.lua"
-            ";C:/msys64/ucrt64/share/lua/5.4/?/init.lua"
-            ";C:/msys64/ucrt64/lib/lua/5.4/?.lua"
-            ";C:/msys64/ucrt64/lib/lua/5.4/?/init.lua"
-            ";C:/msys64/ucrt64/lib/luarocks/rocks-5.4/luasocket/3.1.0-1/lua/?.lua",
-            currentPath);
-        sprintf(scriptPath, "NetRogue/NetRogue.lua");
-#endif
-        lua_pop(L, 1);
-        lua_pushstring(L, newPath);
-        lua_setfield(L, -2, "path");
-
-        // Set package.cpath: LuaSocket native modules (.dll / .so)
-        lua_getfield(L, -1, "cpath");
-        const char* currentCPath = lua_tostring(L, -1);
-        char newCPath[2048];
-#ifdef __EMSCRIPTEN__
-        snprintf(newCPath, sizeof(newCPath), "%s", currentCPath);
-#else
-        snprintf(newCPath, sizeof(newCPath),
-            "%s"
-            ";C:/msys64/ucrt64/lib/lua/5.4/?.dll"
-            ";C:/msys64/ucrt64/lib/lua/5.4/?/core.dll"
-            ";C:/msys64/ucrt64/lib/lua/5.4/socket/?.dll",
-            currentCPath);
-#endif
-        lua_pop(L, 1);
-        lua_pushstring(L, newCPath);
-        lua_setfield(L, -2, "cpath");
-        lua_pop(L, 1);
-        
-        printf("[System] Lua package paths set for NetRogue (with LuaSocket)\n");
-
+    // Extract directory from script path for package.path
+    strncpy(scriptDir, scriptPath, sizeof(scriptDir) - 1);
+    scriptDir[sizeof(scriptDir) - 1] = '\0';
+    char* lastSlash = strrchr(scriptDir, '/');
+    if (lastSlash) {
+        *lastSlash = '\0'; // Truncate to get directory
     } else {
-        lua_getglobal(L, "package");
-        lua_getfield(L, -1, "path");
-        const char* currentPath = lua_tostring(L, -1);
-        char newPath[1024];
-#ifdef __EMSCRIPTEN__
-        snprintf(newPath, sizeof(newPath), "%s;/scripts/demos/?.lua;/scripts/core/?.lua", currentPath);
-        sprintf(scriptPath, "/scripts/demos/%s.lua", scriptName);
-#else
-        snprintf(newPath, sizeof(newPath), "%s;scripts/demos/?.lua;scripts/core/?.lua", currentPath);
-        sprintf(scriptPath, "scripts/demos/%s.lua", scriptName);
-#endif
-        lua_pop(L, 1);
-        lua_pushstring(L, newPath);
-        lua_setfield(L, -2, "path");
-        lua_pop(L, 1);
+        scriptDir[0] = '.'; // No directory, use current
+        scriptDir[1] = '\0';
     }
 
+    // Set up package.path to include script directory + core
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "path");
+    const char* currentPath = lua_tostring(L, -1);
+    char newPath[2048];
+    
+#ifdef __EMSCRIPTEN__
+    // For WASM, convert scriptDir to lowercase to match preload mapping
+    char wasmScriptDir[512];
+    strncpy(wasmScriptDir, scriptDir, sizeof(wasmScriptDir) - 1);
+    wasmScriptDir[sizeof(wasmScriptDir) - 1] = '\0';
+    for (char* p = wasmScriptDir; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = *p + ('a' - 'A');
+        }
+    }
+    snprintf(newPath, sizeof(newPath), 
+        "%s;/%s/?.lua;/scripts/core/?.lua;/?.lua",
+        currentPath, wasmScriptDir);
+#else
+    snprintf(newPath, sizeof(newPath),
+        "%s"
+        ";%s/?.lua"
+        ";scripts/core/?.lua"
+        ";./?.lua"
+        ";C:/msys64/ucrt64/share/lua/5.4/?.lua"
+        ";C:/msys64/ucrt64/share/lua/5.4/?/init.lua"
+        ";C:/msys64/ucrt64/lib/lua/5.4/?.lua"
+        ";C:/msys64/ucrt64/lib/lua/5.4/?/init.lua"
+        ";C:/msys64/ucrt64/lib/luarocks/rocks-5.4/luasocket/3.1.0-1/lua/?.lua",
+        currentPath, scriptDir);
+#endif
+    
+    lua_pop(L, 1);
+    lua_pushstring(L, newPath);
+    lua_setfield(L, -2, "path");
+
+    // Set package.cpath for native modules (LuaSocket, etc.)
+    lua_getfield(L, -1, "cpath");
+    const char* currentCPath = lua_tostring(L, -1);
+    char newCPath[2048];
+#ifdef __EMSCRIPTEN__
+    snprintf(newCPath, sizeof(newCPath), "%s", currentCPath);
+#else
+    snprintf(newCPath, sizeof(newCPath),
+        "%s"
+        ";C:/msys64/ucrt64/lib/lua/5.4/?.dll"
+        ";C:/msys64/ucrt64/lib/lua/5.4/?/core.dll"
+        ";C:/msys64/ucrt64/lib/lua/5.4/socket/?.dll",
+        currentCPath);
+#endif
+    lua_pop(L, 1);
+    lua_pushstring(L, newCPath);
+    lua_setfield(L, -2, "cpath");
+    lua_pop(L, 1);
+    
+    printf("[System] Lua package paths set for: %s\n", scriptDir);
 
     printf("[System] Loading framework.lua...\n");
     if (luaL_dofile(L, frameworkPath) != LUA_OK) {
@@ -870,30 +859,15 @@ int main(int argc, char** argv) {
     }
     printf("[System] Framework loaded successfully\n");
 
-    printf("[System] Loading %s...\n", scriptPath);
-    if (luaL_dofile(L, scriptPath) != LUA_OK) {
-        printf("Error loading %s: %s\n", scriptPath, lua_tostring(L, -1));
+    printf("[System] Loading %s...\n", fullScriptPath);
+    if (luaL_dofile(L, fullScriptPath) != LUA_OK) {
+        printf("Error loading %s: %s\n", fullScriptPath, lua_tostring(L, -1));
         lua_pop(L, 1);
         return 1;
     }
     printf("[System] Script loaded successfully\n");
     
-    // Debug: Check if game state is accessible
-    if (strcmp(scriptName, "MindMarr") == 0) {
-        lua_getglobal(L, "state");
-        if (lua_istable(L, -1)) {
-            lua_getfield(L, -1, "game");
-            if (lua_istable(L, -1)) {
-                lua_getfield(L, -1, "state");
-                if (lua_isstring(L, -1)) {
-                    printf("[System] MindMarr game.state = '%s'\n", lua_tostring(L, -1));
-                }
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
-        }
-        lua_pop(L, 1);
-    }
+
     
     // Verify required functions exist
     lua_getglobal(L, "UpdateUI");

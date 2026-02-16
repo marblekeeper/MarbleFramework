@@ -498,6 +498,8 @@ if exist test_items.exe .\test_items.exe
 if exist test_gen.exe .\test_gen.exe
 exit /b 0
 
+
+
 :DO_GCC
 gcc -std=c99 -w -O2 src\main.c -o %OUT_NAME% -Iinclude -Ivendor\ThirdParty\include -I"%MSYS_DIR%\include" -L"%MSYS_DIR%\lib" -static -l%LUA_LIB% -lm
 goto FINISH

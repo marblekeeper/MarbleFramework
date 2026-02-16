@@ -59,6 +59,8 @@ if "%1"=="netrogue" goto DO_NETROGUE
 if "%1"=="netrogue_join" goto DO_NETROGUE_JOIN
 if "%1"=="netrogue_server" goto DO_NETROGUE_SERVER
 if "%1"=="netrogue_full" goto DO_NETROGUE_FULL
+if "%1"=="netrogue_web" goto DO_NETROGUE_WEB
+if "%1"=="netrogue_web_serve" goto DO_NETROGUE_WEB_SERVE
 
 :USAGE
 echo ================================================================
@@ -71,6 +73,8 @@ echo    netrogue            - Build and launch NetRogue client (renderer)
 echo    netrogue_join       - Launch another client (no rebuild, no kill)
 echo    netrogue_server     - Launch the TCP game server
 echo    netrogue_full       - Launch server + NetRogue client together
+echo    netrogue_web        - Build NetRogue for WASM (browser)
+echo    netrogue_web_serve  - Build and serve NetRogue in browser
 echo.
 echo ClayMarble (Renderer):
 echo    msvc                - Build runtime with Visual Studio cl.exe
@@ -108,7 +112,7 @@ echo Done.
 exit /b 0
 
 REM ================================================================
-REM  NETROGUE — The Unified Target
+REM  NETROGUE — The Unified Target (DESKTOP)
 REM  Builds ClayMarble renderer, launches with NetRogue.lua
 REM  which uses MarbleNet's protocol.lua over TCP
 REM ================================================================
@@ -277,6 +281,148 @@ echo
 echo  Launch additional clients with:
 echo    build.bat netrogue
 echo ================================================
+exit /b 0
+
+REM ================================================================
+REM  NETROGUE WASM BUILD TARGETS
+REM  Phase 1: Offline mode (no networking)
+REM  Phase 2: Online mode (WebSocket via websockify)
+REM ================================================================
+
+:DO_NETROGUE_WEB
+echo ================================================
+echo NETROGUE - WASM BUILD
+echo ================================================
+echo.
+
+REM === Find Emscripten ===
+set "EMCC_PATH="
+if exist "%EMSDK_DIR%\upstream\emscripten\emcc.bat" (
+    set "EMCC_PATH=%EMSDK_DIR%\upstream\emscripten"
+)
+
+if "%EMCC_PATH%"=="" (
+    echo [ERROR] Emscripten not found at %EMSDK_DIR%!
+    echo Install from: https://emscripten.org/docs/getting_started/downloads.html
+    exit /b 1
+)
+
+set "PATH=%EMCC_PATH%;%EMSDK_DIR%;%PATH%"
+
+REM === Check Lua sources ===
+echo [1/3] Checking Lua %LUA_VERSION% for WebAssembly...
+
+if not exist "%LUA_DIR%\src\lua.h" (
+    echo [ERROR] Lua sources not found at %LUA_DIR%\src\
+    echo Expected location: vendor\lua-5.4.7\src\
+    exit /b 1
+)
+
+echo   [OK] Lua sources found
+echo.
+
+REM === Compile Lua for WebAssembly ===
+echo [2/3] Compiling Lua for WebAssembly...
+
+pushd %LUA_DIR%\src
+
+REM Compile all Lua source files to WebAssembly object files
+call emcc -c -O2 -DLUA_USE_POSIX ^
+    lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c ^
+    lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c ^
+    lvm.c lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c ^
+    loadlib.c loslib.c lstrlib.c ltablib.c lutf8lib.c linit.c
+
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Lua compilation failed!
+    popd
+    exit /b 1
+)
+
+REM Create static library
+call emar rcs liblua_wasm.a *.o
+
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Failed to create Lua archive!
+    popd
+    exit /b 1
+)
+
+popd
+echo   [OK] Lua compiled for WebAssembly
+echo.
+
+REM === Build WebAssembly Application ===
+echo [3/3] Building NetRogue for WASM...
+if not exist "web_netrogue" mkdir web_netrogue
+
+call emcc tests\test_ui.c src\bridge_engine.c src\input_handler.c -o web_netrogue\index.html ^
+    -Iinclude -Ivendor\ThirdParty\include -I%LUA_DIR%\src ^
+    -Ivendor\minimp3\minimp3 ^
+    %LUA_DIR%\src\liblua_wasm.a ^
+    -s USE_SDL=2 ^
+    -s FULL_ES2=1 ^
+    -s ALLOW_MEMORY_GROWTH=1 ^
+    -s INITIAL_MEMORY=67108864 ^
+    -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap']" ^
+    -s EXPORTED_FUNCTIONS="['_main','_malloc','_free']" ^
+    --preload-file scripts@/scripts ^
+    --preload-file netrogue@/netrogue ^
+    --preload-file protocol.lua@/ ^
+    --preload-file assets@/assets ^
+    -O2 ^
+    -std=gnu99 ^
+    --shell-file shell_minimal.html
+
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Web build failed!
+    exit /b 1
+)
+
+echo.
+echo ================================================
+echo BUILD SUCCESS!
+echo ================================================
+echo.
+echo Files in web_netrogue/:
+echo   - index.html
+echo   - index.js
+echo   - index.wasm
+echo   - index.data
+echo.
+echo To run:
+echo   build_unified.bat netrogue_web_serve
+echo.
+echo Or manually:
+echo   python -m http.server 8000
+echo   Then open: http://localhost:8000/web_netrogue/
+echo.
+echo NETWORKING NOTES:
+echo   - Check Network.lua OFFLINE_MODE flag
+echo   - OFFLINE_MODE=true: Runs without server (Phase 1)
+echo   - OFFLINE_MODE=false: Needs websockify proxy (Phase 2)
+echo ================================================
+exit /b 0
+
+:DO_NETROGUE_WEB_SERVE
+echo ================================================
+echo NETROGUE - BUILD AND SERVE (WASM)
+echo ================================================
+echo.
+
+REM Build first
+call :DO_NETROGUE_WEB
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+echo.
+echo [Starting local web server...]
+echo.
+echo Open in browser: http://localhost:8000/web_netrogue/
+echo.
+echo Press Ctrl+C to stop the server
+echo.
+
+python -m http.server 8000
 exit /b 0
 
 REM ================================================================
@@ -592,6 +738,7 @@ call emcc tests\test_ui.c src\bridge_engine.c src\input_handler.c -o web\index.h
     -s EXPORTED_FUNCTIONS="['_main','_malloc','_free']" ^
     --preload-file scripts@/scripts ^
     --preload-file "MindMarr@/MindMarr" ^
+    --preload-file "netrogue@/netrogue" ^
     --preload-file assets@/assets ^
     -O2 ^
     -std=gnu99 ^
