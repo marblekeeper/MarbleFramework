@@ -1,0 +1,1816 @@
+==== FILE START actions.lua ==== 
+-- actions.lua
+-- MINDMARR: Player actions - movement, items, floor transitions
+
+local rand, floor = math.random, math.floor
+local max, min = math.max, math.min
+
+local state = require("state")
+local K = require("constants")
+local util = require("util")
+local combat = require("combat")
+local mapgen = require("mapgen")
+
+local game = state.game
+local player = state.player
+
+local M = {}
+
+function M.newFloor()
+    player.seen = {}
+    local rooms = mapgen.generateMap()
+    mapgen.populateFloor(rooms)
+    util.dimFOV()
+    util.computeFOV()
+
+    -- O2 cost per sector transition
+    if game.sector > 1 then
+        local o2cost = rand(5, 12)
+        player.oxygen = max(0, player.oxygen - o2cost)
+        util.addMessage("Airlock transit: -" .. o2cost .. " O2", K.C.oxygen[1], K.C.oxygen[2], K.C.oxygen[3])
+        if player.oxygen <= 0 then
+            game.state = "dead"
+            util.addMessage("Suffocated between sectors.", 255, 50, 50)
+            util.screenShake(6, 0.3)
+            return
+        end
+    end
+
+    if game.sector == game.maxSectors then
+        util.addMessage("== SECTOR " .. game.sector .. ": SHUTTLE BAY ==", 255, 220, 80)
+        util.addMessage("The shuttle is HERE. Reach it!", 255, 255, 150)
+    else
+        util.addMessage("-- Sector " .. game.sector .. " / " .. game.maxSectors .. " --", 255, 180, 100)
+    end
+
+    if rand(1, 100) <= game.sector * 12 then
+        util.marsWhisper()
+    end
+end
+
+local function endOfTurn()
+    game.turn = game.turn + 1
+    combat.moveEnemies()
+
+    game.marsWhisperTimer = game.marsWhisperTimer + 1
+    if game.marsWhisperTimer >= (8 - min(5, game.sector)) then
+        game.marsWhisperTimer = 0
+        util.marsWhisper()
+    end
+
+    util.dimFOV()
+    util.computeFOV()
+    combat.checkSanityDeath()
+end
+
+function M.resolveInteraction(choice)
+    local it = game.interaction
+    if choice == 1 then
+        -- Read
+        local items = state.items
+        -- Find item again to be safe (it should exist at index)
+        if items[it.itemIndex] then
+            if it.isCorrupted then
+                local loss = rand(10, 20)
+                player.sanity = max(0, player.sanity - loss)
+                util.addMessage("CORRUPTED! Your mind fractures... (-" .. loss .. " Sanity)", 255, 50, 50)
+                util.screenShake(4, 0.2)
+                combat.checkSanityDeath()
+            else
+                local gain = rand(10, 20)
+                player.sanity = min(100, player.sanity + gain)
+                util.addMessage("Data integrity verified. (+ " .. gain .. " Sanity)", 100, 255, 100)
+            end
+            util.addMessage("LOG: " .. it.content, 200, 200, 220)
+            
+            -- Remove item after reading
+            table.remove(items, it.itemIndex)
+        end
+    else
+        -- Leave
+        util.addMessage("You step away from the " .. (it.type == "terminal" and "terminal." or "paper."), 150, 150, 150)
+    end
+    
+    -- Reset state
+    game.interaction = {active = false}
+    game.state = "playing"
+end
+
+function M.tryMove(dx, dy)
+    if game.state ~= "playing" then return end
+
+    local nx, ny = player.x + dx, player.y + dy
+
+    local e = util.enemyAt(nx, ny)
+    if e then
+        combat.resolveMelee(player, e, "You", e.name, player.str, e.def, player.dmgMin, player.dmgMax)
+        combat.checkEnemyDeath(e)
+        if game.state ~= "dead" and game.state ~= "mindmarr" then
+            endOfTurn()
+        end
+        return
+    end
+
+    if util.tileAt(nx, ny) == 0 then
+        -- CHECK FOR INTERACTIVE ITEMS BEFORE MOVING
+        local items = state.items
+        for i, it in ipairs(items) do
+            if it.x == nx and it.y == ny then
+                if it.type == "scattered_document" or it.type == "terminal" then
+                    -- Trigger interaction
+                    game.state = "interacting"
+                    game.interaction = {
+                        active = true,
+                        type = it.type,
+                        itemIndex = i,
+                        content = it.content,
+                        isCorrupted = it.isCorrupted
+                    }
+                    return -- Do not move player, do not end turn yet
+                end
+            end
+        end
+
+        player.x = nx; player.y = ny
+
+        -- Instant Pickup Items
+        for i = #items, 1, -1 do
+            local it = items[i]
+            if it.x == nx and it.y == ny then
+                if it.type == "supply" then
+                    player.xp = player.xp + it.amount
+                    util.addMessage("Scavenged supplies (+" .. it.amount .. " XP)", K.C.supply[1], K.C.supply[2], K.C.supply[3])
+                    util.spawnParticles(nx * K.TS + K.TS/2, ny * K.TS + K.TS/2, 6, 100, 220, 140, 40, 0.3)
+                    if player.xp >= player.xpNext then
+                        game.state = "levelup"
+                        player.level = player.level + 1
+                        player.xpNext = floor(player.xpNext * 1.6)
+                        util.addMessage("*** ADAPT — Level " .. player.level .. " ***", 255, 255, 100)
+                        util.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 25, 60, 200, 255, 120, 0.8)
+                    end
+                    table.remove(items, i)
+                elseif it.type == "medkit" then
+                    player.medkits = player.medkits + 1
+                    util.addMessage("Found a medkit!", 100, 255, 150)
+                    util.spawnParticles(nx * K.TS + K.TS/2, ny * K.TS + K.TS/2, 6, 100, 255, 150, 40, 0.3)
+                    table.remove(items, i)
+                elseif it.type == "cell" then
+                    player.cells = player.cells + 1
+                    util.addMessage("POWER CELL acquired! (" .. player.cells .. "/" .. player.cellsNeeded .. ")", K.C.cell[1], K.C.cell[2], K.C.cell[3])
+                    util.spawnParticles(nx * K.TS + K.TS/2, ny * K.TS + K.TS/2, 12, 180, 60, 200, 60, 0.5)
+                    util.screenShake(2, 0.1)
+                    table.remove(items, i)
+                elseif it.type == "oxygen" then
+                    local o2 = rand(10, 20)
+                    player.oxygen = min(100, player.oxygen + o2)
+                    util.addMessage("O2 canister: +" .. o2 .. " oxygen", K.C.oxygen[1], K.C.oxygen[2], K.C.oxygen[3])
+                    util.spawnParticles(nx * K.TS + K.TS/2, ny * K.TS + K.TS/2, 6, 80, 200, 220, 40, 0.3)
+                    table.remove(items, i)
+                elseif it.type == "keycard" then
+                    player.keycards = player.keycards + 1
+                    util.addMessage("KEYCARD found! Can skip a sector via elevator.", K.C.keycard[1], K.C.keycard[2], K.C.keycard[3])
+                    util.spawnParticles(nx * K.TS + K.TS/2, ny * K.TS + K.TS/2, 10, K.C.keycard[1], K.C.keycard[2], K.C.keycard[3], 50, 0.4)
+                    util.screenShake(2, 0.15)
+                    state.elevator.revealed = true
+                    table.remove(items, i)
+                end
+                -- Note: terminal/documents are not removed here, handled in resolveInteraction
+            end
+        end
+
+        -- Elevator (skip sector if player has keycard)
+        if state.elevator.revealed and nx == state.elevator.x and ny == state.elevator.y then
+            if player.keycards > 0 then
+                local skipTo = min(game.maxSectors, game.sector + 2)
+                player.keycards = player.keycards - 1
+                util.addMessage("Elevator activated! Skipping to sector " .. skipTo .. "...", K.C.elevator[1], K.C.elevator[2], K.C.elevator[3])
+                util.screenShake(4, 0.3)
+                util.spawnParticles(nx * K.TS + K.TS/2, ny * K.TS + K.TS/2, 20, K.C.elevator[1], K.C.elevator[2], K.C.elevator[3], 80, 0.6)
+                game.sector = skipTo
+                M.newFloor()
+                return
+            else
+                util.addMessage("Elevator locked. Need a keycard!", 200, 100, 100)
+            end
+        end
+
+        -- Shuttle/airlock
+        if nx == state.shuttle.x and ny == state.shuttle.y then
+            if game.sector == game.maxSectors then
+                if player.cells >= player.cellsNeeded then
+                    game.state = "won"
+                    game.won = true
+                    util.addMessage("You ignite the shuttle engines!", 255, 255, 100)
+                    util.addMessage("ESCAPED! Mars screams behind you.", 80, 255, 120)
+                    util.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 50, 255, 220, 80, 200, 1.5)
+                    util.screenShake(6, 0.5)
+                    return
+                else
+                    util.addMessage("Shuttle needs " .. (player.cellsNeeded - player.cells) .. " more power cells!", 255, 100, 100)
+                end
+            else
+                game.sector = game.sector + 1
+                M.newFloor()
+                return
+            end
+        end
+
+        endOfTurn()
+    end
+end
+
+function M.useMedkit()
+    if player.medkits > 0 and player.hp < player.maxHp then
+        player.medkits = player.medkits - 1
+        local heal = floor(player.maxHp * 0.4) + rand(1, 5)
+        player.hp = min(player.maxHp, player.hp + heal)
+        util.addMessage("Used medkit: +" .. heal .. " HP", 100, 255, 150)
+        util.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 10, 100, 255, 150, 50, 0.4)
+        game.turn = game.turn + 1
+        combat.moveEnemies()
+        util.dimFOV(); util.computeFOV()
+    end
+end
+
+-- Level up choices (apply functions need player reference)
+function M.applyLevelChoice(index)
+    local applies = {
+        function() player.maxHp = player.maxHp + 5; player.hp = player.maxHp end,
+        function() player.str = min(95, player.str + 8) end,
+        function() player.def = min(85, player.def + 8) end,
+        function() player.dmgMax = player.dmgMax + 2 end,
+        function() player.armor = player.armor + 1 end,
+        function() player.sanity = min(100, player.sanity + 15) end,
+        function() player.critBonus = min(25, player.critBonus + 3) end,
+    }
+    if applies[index] then
+        applies[index]()
+        util.addMessage("Adapted: " .. K.levelChoices[index].name, 100, 230, 255)
+        game.state = "playing"
+    end
+end
+
+function M.resetGame()
+    game.state = "playing"
+    game.sector = 1
+    game.turn = 0
+    game.messages = {}
+    game.particles = {}
+    game.marsWhisperTimer = 0
+    game.won = false
+    game.interaction = {active=false}
+
+    player.hp = 30; player.maxHp = 30
+    player.str = 55; player.def = 40
+    player.dmgMin = 2; player.dmgMax = 5
+    player.armor = 0
+    player.xp = 0; player.xpNext = 20
+    player.level = 1
+    player.sanity = 100; player.oxygen = 100
+    player.medkits = 1; player.cells = 0
+    player.cellsNeeded = 3
+    player.kills = 0; player.critBonus = 5
+    player.seen = {}
+    player.keycards = 0
+
+    util.addMessage("Arrows: move/attack. M: medkit. Escape Mars alive.", 180, 180, 220)
+    util.addMessage("Don't lose your mind. Don't say the word.", 200, 60, 80)
+    M.newFloor()
+end
+
+return M 
+==== FILE END ==== 
+ 
+==== FILE START assets.lua ==== 
+-- assets.lua
+-- MINDMARR: Optional sprite asset loading and rendering
+-- Falls back to procedural rendering if assets unavailable
+
+local floor = math.floor
+
+local K = require("constants")
+
+local M = {}
+
+-- Cache for loaded textures (stores {texture, width, height})
+local textureCache = {}
+
+-- Attempt to load a sprite texture
+-- Returns {texture, width, height} or nil if loading fails
+function M.loadSprite(key)
+    if textureCache[key] ~= nil then
+        return textureCache[key] -- Return cached (could be false for failed loads)
+    end
+    
+    local path = K.assets.sprites[key]
+    if not path then
+        textureCache[key] = false
+        return nil
+    end
+    
+    -- Attempt to load texture via bridge
+    if not bridge or not bridge.loadTexture then
+        textureCache[key] = false
+        return nil
+    end
+    
+    -- loadTexture returns (textureId, width, height)
+    local success, texture, w, h = pcall(bridge.loadTexture, path)
+    if success and texture then
+        if key == "enemy_mindcrab" then
+            print(string.format("loadTexture('%s') returned: texture=%s, w=%s, h=%s", 
+                path, tostring(texture), tostring(w), tostring(h)))
+        end
+        textureCache[key] = {texture = texture, width = w or K.TS, height = h or K.TS}
+        return textureCache[key]
+    else
+        textureCache[key] = false
+        return nil
+    end
+end
+
+-- Draw a sprite if available, return true if drawn
+-- x, y: screen coordinates (top-left of tile)
+-- w, h: width and height to draw (optional - uses sprite's natural size if nil)
+-- key: sprite key from K.assets.sprites
+-- frame: which frame to draw (1-indexed, optional)
+-- frameCols, frameRows: sprite sheet layout (optional)
+-- frameWidth, frameHeight: dimensions of each frame in pixels (optional)
+function M.tryDrawSprite(key, x, y, w, h, frame, frameCols, frameRows, frameWidth, frameHeight)
+    local spriteData = M.loadSprite(key)
+    if not spriteData or spriteData == false then
+        return false
+    end
+    
+    -- Calculate source rectangle for frame
+    local srcX, srcY = 0, 0
+    local srcW, srcH = spriteData.width, spriteData.height
+    
+    if frame and frameCols and frameRows then
+        local fWidth = frameWidth or (spriteData.width / frameCols)
+        local fHeight = frameHeight or (spriteData.height / frameRows)
+        local frameIdx = frame - 1  -- 0-indexed
+        local col = frameIdx % frameCols
+        local row = floor(frameIdx / frameCols)
+        srcX = col * fWidth
+        srcY = row * fHeight
+        srcW = fWidth
+        srcH = fHeight
+        
+        -- DEBUG: Print frame info for mind_crab
+        if key == "enemy_mindcrab" then
+            print(string.format("MindCrab Frame: %d, Src(%d,%d %dx%d) -> frameCols=%d rows=%d fW=%d fH=%d", 
+                frame, srcX, srcY, srcW, srcH, frameCols, frameRows, fWidth, fHeight))
+        end
+    end
+    
+    -- Use frame dimensions for drawing if this is an animated sprite
+    local drawW, drawH
+    if frame and frameCols and frameRows then
+        -- For animated sprites, draw at frame size (srcW x srcH), not full texture size
+        drawW = w or srcW  -- srcW is already the frame width after calculation above
+        drawH = h or srcH  -- srcH is already the frame height
+    else
+        -- For static sprites, use full texture size
+        drawW = w or spriteData.width
+        drawH = h or spriteData.height
+    end
+    
+    -- Center the sprite in the tile if it's smaller than tile size
+    local offsetX = 0
+    local offsetY = 0
+    if not w and drawW < K.TS then
+        offsetX = (K.TS - drawW) / 2
+    end
+    if not h and drawH < K.TS then
+        offsetY = (K.TS - drawH) / 2
+    end
+    
+    if bridge and bridge.DrawTextureRegion and frame then
+        -- DEBUG: Print what we're about to send (after all calculations)
+        if key == "enemy_mindcrab" then
+            print(string.format("  About to call DrawTextureRegion with:"))
+            print(string.format("    texture=%s, width=%s, height=%s", 
+                tostring(spriteData.texture), tostring(spriteData.width), tostring(spriteData.height)))
+            print(string.format("    srcX=%s, srcY=%s, srcW=%s, srcH=%s",
+                tostring(srcX), tostring(srcY), tostring(srcW), tostring(srcH)))
+            print(string.format("    dstX=%s, dstY=%s, dstW=%s, dstH=%s",
+                tostring(x + offsetX), tostring(y + offsetY), tostring(drawW), tostring(drawH)))
+        end
+        -- Use region drawing for sprite sheets (preferred)
+        bridge.DrawTextureRegion(spriteData.texture, 
+            spriteData.width, spriteData.height,  -- Texture dimensions
+            srcX, srcY, srcW, srcH,  -- Source rect
+            x + offsetX, y + offsetY, drawW, drawH)  -- Dest rect
+        return true
+    elseif bridge and bridge.drawTexture then
+        -- Fallback: draw full texture (works for non-animated or shows first frame)
+        bridge.drawTexture(spriteData.texture, x + offsetX, y + offsetY, drawW, drawH)
+        return true
+    end
+    
+    return false
+end
+
+-- Clear texture cache (call on game reset if needed)
+function M.clearCache()
+    textureCache = {}
+end
+
+return M 
+==== FILE END ==== 
+ 
+==== FILE START combat.lua ==== 
+-- combat.lua
+-- MINDMARR: Combat resolution, death checks, enemy AI
+
+local rand, floor = math.random, math.floor
+local abs, max, min = math.abs, math.max, math.min
+
+local state = require("state")
+local K = require("constants")
+local util = require("util")
+
+-- Attempt to load the audio module safely
+local audioLoaded, audio = pcall(require, "audio")
+if not audioLoaded then audio = nil end
+
+local game = state.game
+local player = state.player
+
+local M = {}
+
+function M.resolveMelee(attacker, defender, atkName, defName, atkStr, defDef, dmgMin, dmgMax, onDone)
+    local roll = util.d100()
+    local hit = roll <= atkStr
+    local crit = false
+    if attacker == player then crit = roll <= player.critBonus end
+
+    -- Trigger attack animation for attacking enemy
+    if attacker ~= player and attacker.frameCount and attacker.frameCount > 1 then
+        attacker.animState = "attack"
+        attacker.currentFrame = 2  -- Start attack anim at frame 2
+        attacker.animTimer = 0
+    end
+
+    if not hit then
+        util.addMessage(atkName .. " > " .. defName .. ": d100=" .. roll .. " vs " .. atkStr .. " MISS", K.C.miss[1], K.C.miss[2], K.C.miss[3])
+        util.spawnParticles(defender.x * K.TS + K.TS/2, defender.y * K.TS + K.TS/2, 3, 100, 80, 80, 30, 0.3)
+    else
+        local dRoll = util.d100()
+        local dodged = dRoll <= defDef
+
+        if dodged then
+            util.addMessage(defName .. " evades! d100=" .. dRoll .. " vs " .. defDef, K.C.miss[1], K.C.miss[2], K.C.miss[3])
+            util.spawnParticles(defender.x * K.TS + K.TS/2, defender.y * K.TS + K.TS/2, 4, 150, 150, 255, 40, 0.3)
+        else
+            local dmg = rand(dmgMin, dmgMax)
+            if crit then
+                dmg = dmg * 2
+                util.addMessage(atkName .. " CRITS " .. defName .. "! d100=" .. roll .. " DMG:" .. dmg, K.C.crit[1], K.C.crit[2], K.C.crit[3])
+                util.screenShake(5, 0.2)
+                util.spawnParticles(defender.x * K.TS + K.TS/2, defender.y * K.TS + K.TS/2, 15, 255, 200, 60, 80, 0.5)
+            else
+                util.addMessage(atkName .. " hits " .. defName .. " d100=" .. roll .. " DMG:" .. dmg, K.C.hit[1], K.C.hit[2], K.C.hit[3])
+                util.screenShake(3, 0.1)
+                util.spawnParticles(defender.x * K.TS + K.TS/2, defender.y * K.TS + K.TS/2, 8, 255, 80, 60, 60, 0.4)
+            end
+
+            if defender == player and player.armor > 0 then
+                local reduced = max(1, dmg - player.armor)
+                if reduced < dmg then
+                    util.addMessage("  Suit absorbs " .. (dmg - reduced), 160, 160, 180)
+                end
+                dmg = reduced
+            end
+
+            defender.hp = defender.hp - dmg
+
+            if defender == player and rand() < 0.3 then
+                player.sanity = max(0, player.sanity - rand(1, 2))
+                util.addMessage("  Your mind fractures...", K.C.whisper[1], K.C.whisper[2], K.C.whisper[3])
+            end
+        end
+    end
+
+    -- Infected scream mindmarr on attack
+    if attacker ~= player then
+        local say = K.MINDMARR_SAYS[rand(1, #K.MINDMARR_SAYS)]
+        util.addMessage("  " .. atkName .. ": \"" .. say .. "\"", K.C.infected[1], K.C.infected[2], K.C.infected[3])
+    end
+
+    if onDone then onDone() end
+end
+
+function M.checkEnemyDeath(e)
+    if e.hp <= 0 then
+        e.alive = false
+        util.addMessage(e.name .. " collapses: \"mind...marr...\" (+" .. e.xp .. " XP)", K.C.xp[1], K.C.xp[2], K.C.xp[3])
+        util.spawnParticles(e.x * K.TS + K.TS/2, e.y * K.TS + K.TS/2, 20, e.color[1], e.color[2], e.color[3], 100, 0.6)
+        util.screenShake(4, 0.15)
+        player.xp = player.xp + e.xp
+        player.kills = player.kills + 1
+
+        if rand() < 0.4 then
+            state.items[#state.items+1] = {x = e.x, y = e.y, type = "supply", amount = rand(1, 4) + game.sector}
+        end
+
+        if player.xp >= player.xpNext then
+            game.state = "levelup"
+            player.level = player.level + 1
+            player.xpNext = floor(player.xpNext * 1.6)
+            util.addMessage("*** ADAPT — Level " .. player.level .. " ***", 255, 255, 100)
+            util.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 25, 60, 200, 255, 120, 0.8)
+            util.screenShake(3, 0.2)
+        end
+    end
+end
+
+function M.checkPlayerDeath()
+    if player.hp <= 0 then
+        player.hp = 0
+        game.state = "dead"
+        
+        -- Play Audio
+        if K.assets.audio and K.assets.audio.death then
+            if audio and audio.play then
+                audio.play(K.assets.audio.death)
+            elseif bridge and bridge.playSound then
+                -- Direct bridge fallback
+                bridge.playSound(K.assets.audio.death)
+            end
+        end
+
+        util.addMessage("Your body joins the Mindmarr.", 255, 50, 50)
+        util.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 40, 200, 30, 50, 150, 1.0)
+        util.screenShake(8, 0.4)
+    end
+end
+
+function M.checkSanityDeath()
+    if player.sanity <= 0 and game.state == "playing" then
+        game.state = "mindmarr"
+        util.addMessage("Your lips move: \"mindmarr\"", 255, 20, 40)
+        util.addMessage("The last word you ever say.", 255, 0, 0)
+        util.screenShake(10, 0.6)
+        util.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 50, 200, 30, 60, 150, 1.2)
+    end
+end
+
+function M.moveEnemies()
+    for _, e in ipairs(state.enemies) do
+        if not e.alive then goto continue end
+
+        local dx = player.x - e.x
+        local dy = player.y - e.y
+        local adist = abs(dx) + abs(dy)
+
+        if adist > 10 then goto continue end
+
+        -- Nearby enemies mumble
+        if adist <= 6 and rand() < 0.08 then
+            local say = K.MINDMARR_SAYS[rand(1, #K.MINDMARR_SAYS)]
+            util.addMessage(e.name .. ": \"" .. say .. "\"", K.C.infected[1], K.C.infected[2], K.C.infected[3])
+            if rand() < 0.3 then
+                player.sanity = max(0, player.sanity - 1)
+            end
+        end
+
+        if adist == 1 then
+            M.resolveMelee(e, player, e.name, "You", e.str, player.def, e.dmgMin, e.dmgMax)
+            M.checkPlayerDeath()
+            M.checkSanityDeath()
+            goto continue
+        end
+
+        local mx, my = 0, 0
+        if abs(dx) >= abs(dy) then
+            mx = dx > 0 and 1 or -1
+        else
+            my = dy > 0 and 1 or -1
+        end
+
+        local nx, ny = e.x + mx, e.y + my
+        if util.tileAt(nx, ny) == 0 and not util.enemyAt(nx, ny) and not (nx == player.x and ny == player.y) then
+            e.x = nx; e.y = ny
+        else
+            if mx ~= 0 then
+                my = dy > 0 and 1 or (dy < 0 and -1 or 0); mx = 0
+            else
+                mx = dx > 0 and 1 or (dx < 0 and -1 or 0); my = 0
+            end
+            nx, ny = e.x + mx, e.y + my
+            if util.tileAt(nx, ny) == 0 and not util.enemyAt(nx, ny) and not (nx == player.x and ny == player.y) then
+                e.x = nx; e.y = ny
+            end
+        end
+
+        ::continue::
+    end
+end
+
+return M 
+==== FILE END ==== 
+ 
+==== FILE START constants.lua ==== 
+-- constants.lua
+-- MINDMARR: Shared constants, palette, config
+
+local TS = 48
+local MW, MH = 30, 22
+
+local C = {
+    void      = {4, 2, 6},
+    wall      = {90, 40, 25},
+    wallHi    = {120, 55, 35},
+    floor     = {35, 18, 14},
+    floorLit  = {55, 28, 22},
+    player    = {60, 200, 255},
+    infected  = {180, 40, 60},
+    infGlow   = {220, 60, 80},
+    supply    = {100, 220, 140},
+    cell      = {180, 60, 200},
+    shuttle   = {255, 220, 80},
+    fog       = {6, 3, 8},
+    blood     = {140, 30, 40},
+    xp        = {200, 120, 255},
+    crit      = {255, 200, 60},
+    miss      = {100, 80, 80},
+    hit       = {255, 80, 60},
+    hud_bg    = {12, 6, 10},
+    hud_border= {80, 35, 50},
+    mars      = {200, 60, 40},
+    whisper   = {160, 50, 70},
+    sanity    = {120, 180, 255},
+    oxygen    = {80, 200, 220},
+    keycard   = {255, 200, 50},
+    elevator  = {100, 220, 255},
+    -- New Item Colors
+    document  = {240, 240, 220},
+    terminal  = {50, 200, 100},
+    corrupted = {200, 50, 50},
+}
+
+local MINDMARR_SAYS = {
+    "mindmarr...", "MINDMARR!", "mind...marr...", "mindmarr", "MiNdMaRr",
+    "m i n d m a r r", "MINDMARR MINDMARR", "...mindmarr...",
+    "mindmarr?", "MINDMARR.", "mind...m a r r...", "mindmarrMINDMARR",
+}
+
+local marsWhispers = {
+    "The ground pulses beneath you...",
+    "You hear your name spoken from below...",
+    "The walls are breathing...",
+    "Something remembers you were born...",
+    "Mars knows your mother's name...",
+    "The red dust rearranges into a face...",
+    "You feel the planet thinking...",
+    "Your shadow moved on its own...",
+    "The air tastes like someone else's memory...",
+    "mind...marr... NO. Focus.",
+    "A voice in the static: 'Join us.'",
+    "Your reflection blinked before you did...",
+}
+
+local levelChoices = {
+    {name = "+5 Max HP & heal"},
+    {name = "+8 STR (hit chance)"},
+    {name = "+8 DEF (dodge)"},
+    {name = "+2 Max Damage"},
+    {name = "+1 Suit Armor"},
+    {name = "+15 Sanity restored"},
+    {name = "+3 Crit Range"},
+}
+
+-- Lore Database
+local lore = {
+    clean = {
+        "LAB_LOG_01: Subject reports vibrations. Not seismic. A heartbeat.",
+        "RECOVERY_PLAN: Shuttle fueled. Don't listen to the wind.",
+        "MEMO: The filters are failing. The dust... it tastes like iron.",
+        "DIARY: Day 40. They stopped talking. They just stare at the walls.",
+        "TECH_NOTE: The terminals are rewriting themselves. Code I didn't write.",
+    },
+    corrupted = {
+        "SECURITY_FEED: Everyone is red. MINDMARR MINDMARR.",
+        "CAPTAIN'S LOG: 404... miiinnnddddmmaaarrrr...",
+        "ERROR: JOIN US. FLESH IS WEAK. MARS IS ETERNAL.",
+        "01001... MIND... MARR... SUFFOCATE... BREATHE...",
+        "DONT LOOK BEHIND YOU DONT LOOK BEHIND YOU",
+    }
+}
+
+-- Optional sprite assets (if nil/missing, falls back to procedural rendering)
+local assets = {
+    sprites = {
+        -- Characters
+        player = "assets/Content/textures/player_idle.png",
+        enemy_scientist = "assets/Content/textures/scientist_mindmarr.png",
+        enemy_mindcrab = "assets/Content/textures/mind_crab.png",
+        Technician = "assets/Content/textures/scientist_001.png",
+        
+        -- Items & Objects
+        medkit = "assets/Content/textures/medkit.png",
+        supply = "assets/Content/textures/supply.png",
+        cell = "assets/Content/textures/power_cell.png",
+        oxygen = "assets/Content/textures/oxygen_tank.png",
+        keycard = "assets/Content/textures/elevator_keycard.png",
+        shuttle = "assets/Content/textures/shuttle.png",
+        elevator = "assets/Content/textures/elevator.png",
+        
+        -- New Items
+        scattered_document = "assets/Content/textures/handwritten_document.png",
+        terminal = "assets/Content/textures/terminal_001.png",
+    },
+    audio = {
+        death = "assets/Content/audio/demo.mp3",
+        sector_theme = "assets/Content/audio/TG_8.mp3"
+    }
+}
+
+return {
+    TS = TS,
+    MW = MW,
+    MH = MH,
+    C = C,
+    MINDMARR_SAYS = MINDMARR_SAYS,
+    marsWhispers = marsWhispers,
+    levelChoices = levelChoices,
+    assets = assets,
+    lore = lore
+} 
+==== FILE END ==== 
+ 
+==== FILE START draw.lua ==== 
+-- draw.lua
+-- MINDMARR: All rendering
+
+local sin, cos, rand, floor = math.sin, math.cos, math.random, math.floor
+local abs, max, min = math.abs, math.max, math.min
+
+local state = require("state")
+local K = require("constants")
+local util = require("util")
+local assets = require("assets")
+
+local game = state.game
+local player = state.player
+
+local W, H = 800, 600
+
+local M = {}
+
+function M.setSize(w, h)
+    W, H = w, h
+end
+
+local function drawTile(sx, sy, tx, ty)
+    local camOX = floor(W/2 - player.x * K.TS - K.TS/2)
+    local camOY = floor(H * 0.4 - player.y * K.TS - K.TS/2)
+    local px = camOX + tx * K.TS + sx
+    local py = camOY + ty * K.TS + sy
+    local mapAreaH = floor(H * 0.65)
+
+    if px < -K.TS or px > W + K.TS or py < -K.TS or py > mapAreaH + K.TS then return end
+
+    local vis = util.isVisible(tx, ty)
+    local seen = util.isSeen(tx, ty)
+    local tile = util.tileAt(tx, ty)
+
+    if not seen then
+        bridge.drawRect(px, py, K.TS, K.TS, K.C.void[1], K.C.void[2], K.C.void[3], 255)
+        return
+    end
+
+    local dim = vis and 1.0 or 0.3
+
+    local marsPulse = 0
+    if vis and game.sector > 2 then
+        marsPulse = sin(game.pulseTimer * 2 + tx * 0.3 + ty * 0.5) * 8 * (game.sector / game.maxSectors)
+    end
+
+    if tile == 1 then
+        local cr, cg, cb = K.C.wall[1], K.C.wall[2], K.C.wall[3]
+        if (tx + ty) % 3 == 0 then cr, cg, cb = K.C.wallHi[1], K.C.wallHi[2], K.C.wallHi[3] end
+        cr = min(255, cr + marsPulse)
+        bridge.drawRect(px, py, K.TS, K.TS, floor(cr*dim), floor(cg*dim), floor(cb*dim), 255)
+        if vis and ty > 1 and util.tileAt(tx, ty-1) == 0 then
+            bridge.drawRect(px, py, K.TS, 2, floor(100*dim), floor(50*dim), floor(40*dim), 255)
+        end
+    else
+        local cr, cg, cb = K.C.floor[1], K.C.floor[2], K.C.floor[3]
+        if vis then cr, cg, cb = K.C.floorLit[1], K.C.floorLit[2], K.C.floorLit[3] end
+        cr = min(255, cr + marsPulse * 0.5)
+        bridge.drawRect(px, py, K.TS, K.TS, floor(cr*dim), floor(cg*dim), floor(cb*dim), 255)
+        if (tx * 7 + ty * 13) % 11 == 0 then
+            bridge.drawRect(px + 4, py + 4, 2, 2, floor(cr*dim*0.6), floor(cg*dim*0.6), floor(cb*dim*0.6), 255)
+        end
+        if vis and game.sector >= 3 and (tx * 3 + ty * 7) % 17 == 0 then
+            bridge.drawRect(px + rand(2, K.TS-4), py + rand(2, K.TS-4), 1, 1, 140, 50, 30, 60)
+        end
+    end
+end
+
+local function drawTitle()
+    bridge.drawRect(0, 0, W, H, 8, 3, 6, 255)
+    for x = 0, W, 4 do
+        local yy = H * 0.55 + sin(x * 0.02 + game.pulseTimer) * 8
+        bridge.drawRect(x, yy, 4, H - yy, 50, 15, 10, 80)
+    end
+
+    bridge.drawText("M I N D M A R R", W/2 - 70, H/4 - 10, 255, 40, 50, 255)
+    bridge.drawText("Mars is alive. Mars remembers.", W/2 - 105, H/4 + 18, 180, 60, 70, 255)
+
+    bridge.drawText("You are a survivor. The colony is lost.", W/2 - 130, H/2 - 20, 160, 140, 150, 255)
+    bridge.drawText("Everyone speaks only one word now.", W/2 - 120, H/2, 160, 140, 150, 255)
+    bridge.drawText("If you say it, you join them.", W/2 - 100, H/2 + 20, 200, 60, 70, 255)
+
+    bridge.drawText("Arrow Keys: Move & Fight", W/2 - 85, H/2 + 55, 140, 140, 160, 255)
+    bridge.drawText("M: Medkit    Reach the shuttle.", W/2 - 100, H/2 + 75, 140, 140, 160, 255)
+
+    local flicker = sin(game.pulseTimer * 3) > 0 and 255 or 180
+    bridge.drawText("PRESS SPACE", W/2 - 40, H * 0.82, flicker, flicker, min(255, flicker + 20), 255)
+end
+
+local function drawWon()
+    bridge.drawRect(0, 0, W, H, 4, 8, 15, 255)
+    for i = 1, 60 do
+        local sx2 = (i * 137 + floor(game.pulseTimer * 10)) % W
+        local sy2 = (i * 211) % H
+        bridge.drawRect(sx2, sy2, 1, 1, 255, 255, 255, rand(100, 255))
+    end
+
+    bridge.drawText("E S C A P E D", W/2 - 55, H/4, 80, 255, 120, 255)
+    bridge.drawText("Mars screams behind you, but you don't look back.", W/2 - 170, H/4 + 30, 160, 200, 180, 255)
+
+    bridge.drawText("Level: " .. player.level .. "  Kills: " .. player.kills, W/2 - 70, H/2, 200, 200, 220, 255)
+    bridge.drawText("Sanity: " .. player.sanity .. "%  O2: " .. player.oxygen .. "%", W/2 - 80, H/2 + 20, K.C.sanity[1], K.C.sanity[2], K.C.sanity[3], 255)
+    bridge.drawText("Cells: " .. player.cells .. "  Sectors cleared: " .. game.maxSectors, W/2 - 100, H/2 + 40, K.C.cell[1], K.C.cell[2], K.C.cell[3], 255)
+
+    local score = player.kills * 10 + player.sanity * 5 + player.oxygen * 2 + game.maxSectors * 100
+    bridge.drawText("Score: " .. score, W/2 - 35, H/2 + 70, 255, 220, 80, 255)
+
+    bridge.drawText("PRESS SPACE TO PLAY AGAIN", W/2 - 90, H * 0.8, 180, 180, 200, 255)
+end
+
+local function drawMindmarr()
+    local pulse = sin(game.pulseTimer * 4) * 0.3 + 0.7
+    bridge.drawRect(0, 0, W, H, floor(30 * pulse), floor(5 * pulse), floor(8 * pulse), 255)
+
+    bridge.drawText("m i n d m a r r", W/2 - 60, H/4, 255, floor(40 * pulse), floor(50 * pulse), 255)
+    bridge.drawText("You are one of them now.", W/2 - 80, H/4 + 30, 200, 60, 70, 255)
+    bridge.drawText("Your mouth only forms one word.", W/2 - 110, H/4 + 55, 180, 50, 60, 255)
+
+    for i = 0, 12 do
+        local yy = H/2 + 10 + i * 16
+        local off = floor(game.pulseTimer * 40 + i * 50) % W
+        local alpha = max(40, 200 - i * 15)
+        bridge.drawText("mindmarr mindmarr mindmarr mindmarr mindmarr", -off + W/2, yy,
+            floor(200 * pulse), 30, 40, alpha)
+    end
+
+    bridge.drawText("Floor: " .. game.sector .. "  Level: " .. player.level .. "  Kills: " .. player.kills, W/4, H * 0.82, 200, 200, 200, 200)
+    bridge.drawText("PRESS SPACE", W/2 - 40, H * 0.9, 180, 100, 110, 255)
+end
+
+local function drawHUD(mapAreaH)
+    local hudY = mapAreaH + 2
+    local hudH = H - hudY
+    bridge.drawRect(0, hudY, W, hudH, K.C.hud_bg[1], K.C.hud_bg[2], K.C.hud_bg[3], 255)
+    bridge.drawRect(0, hudY, W, 2, K.C.hud_border[1], K.C.hud_border[2], K.C.hud_border[3], 255)
+
+    local col1 = 10
+    local ly = hudY + 6
+
+    -- Row 1: Level, Sector
+    bridge.drawText("LVL:" .. player.level, col1, ly, 255, 255, 150, 255)
+    bridge.drawText("SECTOR:" .. game.sector .. "/" .. game.maxSectors, col1 + 55, ly, 255, 180, 100, 255)
+
+    ly = ly + 14
+
+    -- Row 2: HP bar
+    bridge.drawText("HP:", col1, ly, 200, 200, 200, 255)
+    local barX = col1 + 28
+    local barW = 80
+    local barH = 10
+    bridge.drawRect(barX, ly, barW, barH, 40, 10, 15, 255)
+    local hpW = floor(barW * (player.hp / player.maxHp))
+    local hpR = player.hp <= player.maxHp * 0.3 and 255 or 50
+    local hpG = player.hp <= player.maxHp * 0.3 and 50 or 200
+    bridge.drawRect(barX, ly, hpW, barH, hpR, hpG, 50, 255)
+    bridge.drawText(player.hp .. "/" .. player.maxHp, barX + barW + 4, ly, 200, 200, 200, 255)
+
+    -- Sanity bar
+    local sanX = barX + barW + 55
+    bridge.drawText("SAN:", sanX, ly, K.C.sanity[1], K.C.sanity[2], K.C.sanity[3], 255)
+    local sanBarX = sanX + 32
+    bridge.drawRect(sanBarX, ly, 60, barH, 20, 20, 40, 255)
+    local sanW = floor(60 * (player.sanity / 100))
+    local sanR = player.sanity <= 25 and 200 or K.C.sanity[1]
+    local sanG = player.sanity <= 25 and 50 or K.C.sanity[2]
+    bridge.drawRect(sanBarX, ly, sanW, barH, sanR, sanG, K.C.sanity[3], 255)
+    bridge.drawText(player.sanity .. "%", sanBarX + 63, ly, K.C.sanity[1], K.C.sanity[2], K.C.sanity[3], 255)
+
+    ly = ly + 14
+
+    -- Row 3: Stats
+    bridge.drawText("STR:" .. player.str .. " DEF:" .. player.def .. " DMG:" .. player.dmgMin .. "-" .. player.dmgMax, col1, ly, 180, 160, 170, 255)
+
+    local o2X = 260
+    bridge.drawText("O2:", o2X, ly, K.C.oxygen[1], K.C.oxygen[2], K.C.oxygen[3], 255)
+    bridge.drawText(player.oxygen .. "%", o2X + 24, ly, K.C.oxygen[1], K.C.oxygen[2], K.C.oxygen[3], 255)
+
+    ly = ly + 14
+
+    -- Row 4: Items
+    bridge.drawText("ARM:" .. player.armor .. " CRIT:<=" .. player.critBonus, col1, ly, 160, 150, 170, 255)
+    bridge.drawText("XP:" .. player.xp .. "/" .. player.xpNext, col1 + 160, ly, K.C.xp[1], K.C.xp[2], K.C.xp[3], 255)
+
+    ly = ly + 14
+
+    -- Row 5
+    bridge.drawText("Medkits:" .. player.medkits, col1, ly, 255, 100, 100, 255)
+    bridge.drawText("Keys:" .. player.keycards, col1 + 80, ly, K.C.keycard[1], K.C.keycard[2], K.C.keycard[3], 255)
+    bridge.drawText("Cells:" .. player.cells .. "/" .. player.cellsNeeded, col1 + 140, ly, K.C.cell[1], K.C.cell[2], K.C.cell[3], 255)
+    bridge.drawText("Kills:" .. player.kills, col1 + 260, ly, 200, 140, 140, 255)
+
+    -- Message log
+    local msgX = W/2 + 20
+    local msgY = hudY + 8
+    bridge.drawText("-- Transmission Log --", msgX, msgY, 100, 70, 90, 255)
+    for i, msg in ipairs(game.messages) do
+        local alpha = max(80, 255 - i * 25)
+        bridge.drawText(msg.text, msgX, msgY + i * 13, msg.r, msg.g, msg.b, alpha)
+        if msgY + i * 13 > H - 5 then break end
+    end
+end
+
+function M.drawGame()
+    local sx, sy = 0, 0
+    if game.shakeTimer > 0 then
+        sx = floor((rand() - 0.5) * game.shakeIntensity * 2)
+        sy = floor((rand() - 0.5) * game.shakeIntensity * 2)
+    end
+
+    bridge.drawRect(0, 0, W, H, K.C.void[1], K.C.void[2], K.C.void[3], 255)
+
+    if game.state == "title" then drawTitle(); return end
+    if game.state == "won" then drawWon(); return end
+    if game.state == "mindmarr" then drawMindmarr(); return end
+
+    local camOX = floor(W/2 - player.x * K.TS - K.TS/2)
+    local camOY = floor(H * 0.4 - player.y * K.TS - K.TS/2)
+    local mapAreaH = floor(H * 0.65)
+
+    -- Map tiles
+    local startTX = max(1, floor(-camOX / K.TS) - 1)
+    local endTX = min(K.MW, floor((-camOX + W) / K.TS) + 2)
+    local startTY = max(1, floor(-camOY / K.TS) - 1)
+    local endTY = min(K.MH, floor((-camOY + mapAreaH) / K.TS) + 2)
+
+    for ty = startTY, endTY do
+        for tx = startTX, endTX do
+            drawTile(sx, sy, tx, ty)
+        end
+    end
+
+    -- Shuttle/airlock
+    if util.isVisible(state.shuttle.x, state.shuttle.y) then
+        local stX = camOX + state.shuttle.x * K.TS + sx
+        local stY = camOY + state.shuttle.y * K.TS + sy
+        local drewShuttle = assets.tryDrawSprite("shuttle", stX, stY, K.TS, K.TS)
+        if not drewShuttle then
+            if game.sector == game.maxSectors then
+                local glow = sin(game.pulseTimer * 3) * 20 + 220
+                bridge.drawRect(stX + 2, stY + 2, K.TS - 4, K.TS - 4, floor(glow), floor(glow * 0.85), 40, 255)
+                bridge.drawRect(stX + 5, stY + 5, K.TS - 10, K.TS - 10, 200, 180, 60, 255)
+                bridge.drawText("^", stX + 8, stY + 4, 255, 255, 200, 255)
+            else
+                bridge.drawRect(stX + 4, stY + 4, K.TS - 8, K.TS - 8, K.C.shuttle[1], K.C.shuttle[2], K.C.shuttle[3], 255)
+                bridge.drawText(">", stX + 8, stY + 5, 255, 240, 180, 255)
+            end
+        end
+    elseif util.isSeen(state.shuttle.x, state.shuttle.y) then
+        local stX = camOX + state.shuttle.x * K.TS + sx
+        local stY = camOY + state.shuttle.y * K.TS + sy
+        bridge.drawRect(stX + 4, stY + 4, K.TS - 8, K.TS - 8, 60, 50, 25, 255)
+    end
+
+    -- Elevator
+    if state.elevator.revealed and util.isVisible(state.elevator.x, state.elevator.y) then
+        local ex = camOX + state.elevator.x * K.TS + sx
+        local ey = camOY + state.elevator.y * K.TS + sy
+        local drewElevator = assets.tryDrawSprite("elevator", ex, ey, K.TS, K.TS)
+        if not drewElevator then
+            local pulse = sin(game.pulseTimer * 3) * 15 + 100
+            bridge.drawRect(ex + 3, ey + 3, K.TS - 6, K.TS - 6, floor(pulse), floor(pulse * 2.2), 255, 255)
+            bridge.drawRect(ex + 6, ey + 6, K.TS - 12, K.TS - 12, K.C.elevator[1], K.C.elevator[2], K.C.elevator[3], 255)
+            bridge.drawText("E", ex + 8, ey + 6, 255, 255, 255, 255)
+        end
+    elseif state.elevator.revealed and util.isSeen(state.elevator.x, state.elevator.y) then
+        local ex = camOX + state.elevator.x * K.TS + sx
+        local ey = camOY + state.elevator.y * K.TS + sy
+        bridge.drawRect(ex + 6, ey + 6, K.TS - 12, K.TS - 12, 40, 80, 100, 255)
+    end
+
+    -- Items
+    for _, it in ipairs(state.items) do
+        if util.isVisible(it.x, it.y) then
+            local ix = camOX + it.x * K.TS + sx
+            local iy = camOY + it.y * K.TS + sy
+            local spriteKey = it.spriteKey or it.type
+            local drewSprite = assets.tryDrawSprite(spriteKey, ix, iy, K.TS, K.TS)
+
+            if not drewSprite then
+                -- Fallback procedural item rendering
+                if it.type == "supply" then
+                    bridge.drawRect(ix + 7, iy + 7, 10, 10, K.C.supply[1], K.C.supply[2], K.C.supply[3], 255)
+                    bridge.drawRect(ix + 9, iy + 9, 5, 5, 140, 255, 180, 255)
+                elseif it.type == "medkit" then
+                    bridge.drawRect(ix + 6, iy + 6, 12, 12, 255, 80, 80, 255)
+                    bridge.drawRect(ix + 10, iy + 7, 4, 10, 255, 255, 255, 255)
+                    bridge.drawRect(ix + 7, iy + 10, 10, 4, 255, 255, 255, 255)
+                elseif it.type == "cell" then
+                    local cg = sin(game.pulseTimer * 4) * 40 + 180
+                    bridge.drawRect(ix + 5, iy + 4, 14, 16, floor(cg), 50, floor(cg * 1.1), 255)
+                    bridge.drawRect(ix + 8, iy + 7, 8, 10, 220, 80, 240, 255)
+                elseif it.type == "oxygen" then
+                    bridge.drawRect(ix + 7, iy + 5, 10, 14, K.C.oxygen[1], K.C.oxygen[2], K.C.oxygen[3], 255)
+                    bridge.drawRect(ix + 9, iy + 3, 6, 4, 60, 160, 180, 255)
+                elseif it.type == "keycard" then
+                    local glow = sin(game.pulseTimer * 4) * 20 + 220
+                    bridge.drawRect(ix + 4, iy + 5, 16, 14, floor(glow), floor(glow * 0.8), 50, 255)
+                    bridge.drawRect(ix + 6, iy + 7, 12, 10, K.C.keycard[1], K.C.keycard[2], K.C.keycard[3], 255)
+                    bridge.drawRect(ix + 8, iy + 11, 3, 3, 80, 60, 20, 255)
+                elseif it.type == "scattered_document" then
+                    -- Paper sheet
+                    bridge.drawRect(ix + 8, iy + 8, 14, 18, K.C.document[1], K.C.document[2], K.C.document[3], 255)
+                    bridge.drawRect(ix + 10, iy + 10, 10, 2, 50, 50, 50, 200)
+                    bridge.drawRect(ix + 10, iy + 14, 10, 2, 50, 50, 50, 200)
+                elseif it.type == "terminal" then
+                    -- Computer Monitor
+                    bridge.drawRect(ix + 6, iy + 6, 20, 18, 50, 50, 50, 255) -- Case
+                    local scrG = sin(game.pulseTimer * 5) * 30 + 100
+                    bridge.drawRect(ix + 8, iy + 8, 16, 12, 10, floor(scrG), 30, 255) -- Screen
+                    bridge.drawRect(ix + 8, iy + 22, 20, 4, 40, 40, 40, 255) -- Keyboard
+                end
+            end
+        end
+    end
+
+    -- Enemies
+    for _, e in ipairs(state.enemies) do
+        if e.alive and util.isVisible(e.x, e.y) then
+            local ex = camOX + e.x * K.TS + sx
+            local ey = camOY + e.y * K.TS + sy
+            local drewSprite = false
+            if e.spriteKey then
+                if e.frameCount and e.frameCount > 1 then
+                    drewSprite = assets.tryDrawSprite(e.spriteKey, ex, ey, K.TS, K.TS,
+                        e.currentFrame, e.frameCols, e.frameRows, e.frameWidth, e.frameHeight)
+                else
+                    drewSprite = assets.tryDrawSprite(e.spriteKey, ex, ey, K.TS, K.TS)
+                end
+            end
+            
+            if not drewSprite then
+                local aura = sin(game.pulseTimer * 5 + e.x) * 15
+                bridge.drawRect(ex + 2, ey + 2, K.TS - 4, K.TS - 4,
+                    min(255, e.color[1] + floor(aura)), min(255, e.color[2]), min(255, e.color[3]), 255)
+                bridge.drawRect(ex + 5, ey + 5, K.TS - 10, K.TS - 10,
+                    min(255, e.color[1]+30), min(255, e.color[2]+20), min(255, e.color[3]+20), 255)
+            end
+            
+            if e.hp < e.maxHp then
+                local bW = K.TS - 4
+                local hpFrac = e.hp / e.maxHp
+                bridge.drawRect(ex + 2, ey - 3, bW, 3, 40, 10, 15, 200)
+                bridge.drawRect(ex + 2, ey - 3, floor(bW * hpFrac), 3, 255, 40, 50, 255)
+            end
+        end
+    end
+
+    -- Player
+    if game.state ~= "dead" then
+        local px_draw = camOX + player.x * K.TS + sx
+        local py_draw = camOY + player.y * K.TS + sy
+        local drewSprite = assets.tryDrawSprite("player", px_draw, py_draw, K.TS, K.TS)
+        
+        if not drewSprite then
+            bridge.drawRect(px_draw + 2, py_draw + 2, K.TS - 4, K.TS - 4, K.C.player[1], K.C.player[2], K.C.player[3], 255)
+            bridge.drawRect(px_draw + 5, py_draw + 5, K.TS - 10, K.TS - 10, 100, 220, 255, 255)
+            bridge.drawRect(px_draw + 7, py_draw + 6, 10, 5, 20, 60, 80, 255)
+            bridge.drawRect(px_draw + 8, py_draw + 7, 8, 3, 40, 140, 180, 255)
+        end
+    end
+
+    -- Particles
+    for _, p in ipairs(game.particles) do
+        local alpha = floor(255 * (p.life / p.maxLife))
+        if alpha > 0 then
+            local ppx = camOX + p.x + sx
+            local ppy = camOY + p.y + sy
+            if ppx > -10 and ppx < W + 10 and ppy > -10 and ppy < mapAreaH + 10 then
+                bridge.drawRect(ppx - p.size/2, ppy - p.size/2, p.size, p.size, p.r, p.g, p.b, alpha)
+            end
+        end
+    end
+
+    drawHUD(mapAreaH)
+
+    -- Interaction Overlay (Documents/Terminals)
+    if game.state == "interacting" then
+        bridge.drawRect(W/4, H/3, W/2, 200, 15, 15, 20, 240)
+        bridge.drawRect(W/4, H/3, W/2, 2, 100, 200, 255, 255)
+        
+        local typeName = (game.interaction.type == "terminal") and "TERMINAL FOUND" or "SCATTERED DOCUMENT"
+        bridge.drawText(typeName, W/4 + 20, H/3 + 20, 100, 230, 255, 255)
+        
+        bridge.drawText("1. Read", W/4 + 40, H/3 + 60, 255, 255, 255, 255)
+        bridge.drawText("2. Leave", W/4 + 40, H/3 + 90, 200, 200, 200, 255)
+        
+        if game.interaction.type == "terminal" then
+             bridge.drawText("(Only on North Walls)", W/4 + 20, H/3 + 150, 100, 100, 100, 255)
+        end
+    end
+
+    -- Level up overlay
+    if game.state == "levelup" then
+        bridge.drawRect(W/4, H/4, W/2, H/2, 10, 8, 20, 240)
+        bridge.drawRect(W/4, H/4, W/2, 2, 60, 200, 255, 255)
+        bridge.drawText("ADAPT — Choose an upgrade:", W/4 + 20, H/4 + 12, 100, 230, 255, 255)
+        for i, choice in ipairs(K.levelChoices) do
+            local y = H/4 + 30 + (i-1) * 22
+            bridge.drawRect(W/4 + 15, y, W/2 - 30, 18, 25, 18, 40, 200)
+            bridge.drawText(i .. ") " .. choice.name, W/4 + 22, y + 2, 200, 220, 240, 255)
+        end
+    end
+
+    -- Death overlay
+    if game.state == "dead" then
+        bridge.drawRect(W/4, H/3, W/2, H/4, 25, 5, 8, 230)
+        bridge.drawRect(W/4, H/3, W/2, 2, 255, 40, 50, 255)
+        bridge.drawText("SIGNAL LOST", W/4 + 55, H/3 + 15, 255, 50, 60, 255)
+        bridge.drawText("Sector: " .. game.sector .. "  Level: " .. player.level .. "  Kills: " .. player.kills, W/4 + 15, H/3 + 35, 200, 200, 200, 255)
+        local score = player.kills * 10 + game.sector * 50
+        bridge.drawText("Score: " .. score, W/4 + 60, H/3 + 52, 255, 200, 80, 255)
+        bridge.drawText("PRESS SPACE TO TRY AGAIN", W/4 + 25, H/3 + 75, 180, 180, 180, 255)
+    end
+end
+
+return M 
+==== FILE END ==== 
+ 
+==== FILE START mapgen.lua ==== 
+-- mapgen.lua
+-- MINDMARR: Map generation
+
+local rand, floor = math.random, math.floor
+local max, min = math.max, math.min
+
+local state = require("state")
+local K = require("constants")
+local util = require("util")
+
+local game = state.game
+local player = state.player
+
+local M = {}
+
+local function carveRoom(rx, ry, rw, rh)
+    for y = ry, ry + rh - 1 do
+        for x = rx, rx + rw - 1 do
+            util.setTile(x, y, 0)
+        end
+    end
+    return {x = rx, y = ry, w = rw, h = rh,
+            cx = floor(rx + rw/2), cy = floor(ry + rh/2)}
+end
+
+local function carveCorridor(x1, y1, x2, y2)
+    local x, y = x1, y1
+    while x ~= x2 do
+        util.setTile(x, y, 0)
+        x = x + (x2 > x and 1 or -1)
+    end
+    while y ~= y2 do
+        util.setTile(x, y, 0)
+        y = y + (y2 > y and 1 or -1)
+    end
+end
+
+function M.generateMap()
+    -- Reset map table in-place
+    local map = state.map
+    for k in pairs(map) do map[k] = nil end
+
+    for y = 1, K.MH do
+        map[y] = {}
+        for x = 1, K.MW do
+            map[y][x] = 1
+        end
+    end
+
+    local rooms = {}
+    local attempts = 0
+    local numRooms = rand(6, 9) + floor(game.sector / 2)
+
+    while #rooms < numRooms and attempts < 200 do
+        attempts = attempts + 1
+        local rw = rand(3, 7)
+        local rh = rand(3, 5)
+        local rx = rand(2, K.MW - rw - 1)
+        local ry = rand(2, K.MH - rh - 1)
+
+        local ok = true
+        for _, r in ipairs(rooms) do
+            if rx < r.x + r.w + 1 and rx + rw + 1 > r.x and
+               ry < r.y + r.h + 1 and ry + rh + 1 > r.y then
+                ok = false; break
+            end
+        end
+
+        if ok then
+            local room = carveRoom(rx, ry, rw, rh)
+            if #rooms > 0 then
+                local prev = rooms[#rooms]
+                if rand() < 0.5 then
+                    carveCorridor(prev.cx, prev.cy, room.cx, prev.cy)
+                    carveCorridor(room.cx, prev.cy, room.cx, room.cy)
+                else
+                    carveCorridor(prev.cx, prev.cy, prev.cx, room.cy)
+                    carveCorridor(prev.cx, room.cy, room.cx, room.cy)
+                end
+            end
+            rooms[#rooms+1] = room
+        end
+    end
+
+    for i = 1, floor(#rooms / 3) do
+        local a = rooms[rand(1, #rooms)]
+        local b = rooms[rand(1, #rooms)]
+        if a ~= b then carveCorridor(a.cx, a.cy, b.cx, b.cy) end
+    end
+
+    return rooms
+end
+
+-- Infected templates
+function M.infectedTemplate(sector)
+    local templates = {
+        {name="MindCrab",     glyph="c", spriteKey="enemy_mindcrab", hp=4,  str=25, def=10, dmgMin=1, dmgMax=2, xp=3,  color={160,90,110},
+         frameCount=4, frameCols=2, frameRows=2, frameWidth=16, frameHeight=16, animFPS=5},
+        {name="Scientist",    glyph="S", spriteKey="enemy_scientist", hp=7,  str=30, def=15, dmgMin=1, dmgMax=3, xp=5,  color={180,100,120}},
+        {name="Technician",   glyph="T", spriteKey="Technician", hp=10, str=40, def=20, dmgMin=2, dmgMax=4, xp=8,  color={160,80,100}},
+        {name="Security",     glyph="G", spriteKey="enemy_scientist", hp=14, str=50, def=25, dmgMin=2, dmgMax=5, xp=12, color={200,70,90}},
+        {name="Commander",    glyph="C", spriteKey="enemy_scientist", hp=20, str=55, def=30, dmgMin=3, dmgMax=7, xp=20, color={220,50,70}},
+        {name="MarsSpawn",    glyph="M", hp=16, str=60, def=45, dmgMin=3, dmgMax=6, xp=25, color={200,40,60}},
+        {name="Hivemind",     glyph="H", hp=35, str=65, def=30, dmgMin=5, dmgMax=10,xp=40, color={180,30,80}},
+        {name="MINDMARR",     glyph="@", hp=50, str=75, def=40, dmgMin=6, dmgMax=12,xp=60, color={255,20,50}},
+    }
+
+    local maxIdx = min(#templates, 2 + floor(sector / 2))
+    local minIdx = (sector == 1) and 1 or max(1, maxIdx - 3)
+    local t = templates[rand(minIdx, maxIdx)]
+
+    local scale = 1.0 + (sector - 1) * 0.12
+    return {
+        name = t.name,
+        glyph = t.glyph,
+        spriteKey = t.spriteKey,
+        hp = floor(t.hp * scale),
+        maxHp = floor(t.hp * scale),
+        str = min(90, floor(t.str + sector * 2)),
+        def = min(80, floor(t.def + sector)),
+        dmgMin = t.dmgMin + floor(sector / 3),
+        dmgMax = t.dmgMax + floor(sector / 3),
+        xp = floor(t.xp * scale),
+        color = t.color,
+        alive = true,
+        sayTimer = 0,
+        lastSaid = "",
+        frameCount = t.frameCount or 1,
+        frameCols = t.frameCols or 1,
+        frameRows = t.frameRows or 1,
+        frameWidth = t.frameWidth or K.TS,
+        frameHeight = t.frameHeight or K.TS,
+        animFPS = t.animFPS or 10,
+        currentFrame = 1,
+        animTimer = 0,
+        animState = "idle",
+    }
+end
+
+-- Helper to pick content
+local function getContent()
+    local isCorr = rand() < 0.25
+    local list = isCorr and K.lore.corrupted or K.lore.clean
+    return list[rand(1, #list)], isCorr
+end
+
+function M.populateFloor(rooms)
+    local enemies = state.enemies
+    for k in pairs(enemies) do enemies[k] = nil end
+    local items = state.items
+    for k in pairs(items) do items[k] = nil end
+
+    player.x = rooms[1].cx
+    player.y = rooms[1].cy
+
+    state.shuttle.x = rooms[#rooms].cx
+    state.shuttle.y = rooms[#rooms].cy
+
+    if #rooms >= 3 then
+        local elevRoom = rooms[rand(2, #rooms - 1)]
+        state.elevator.x = elevRoom.cx
+        state.elevator.y = elevRoom.cy
+        state.elevator.revealed = false
+    end
+
+    local numEnemies = 3 + game.sector * 2 + rand(0, 2)
+    for i = 1, numEnemies do
+        local room = rooms[rand(2, #rooms)]
+        local ex = rand(room.x, room.x + room.w - 1)
+        local ey = rand(room.y, room.y + room.h - 1)
+        if not (ex == player.x and ey == player.y) and util.tileAt(ex, ey) == 0 then
+            local e = M.infectedTemplate(game.sector)
+            e.x = ex; e.y = ey
+            enemies[#enemies+1] = e
+        end
+    end
+
+    for i = 2, #rooms do
+        local room = rooms[i]
+        
+        -- Scattered Documents (Random floor)
+        if rand() < 0.25 then
+            local txt, corr = getContent()
+            items[#items+1] = {
+                x = rand(room.x, room.x + room.w - 1),
+                y = rand(room.y, room.y + room.h - 1),
+                type = "scattered_document",
+                spriteKey = "scattered_document",
+                content = txt,
+                isCorrupted = corr
+            }
+        end
+
+        -- Terminals (North Walls Only)
+        -- We scan the room for floor tiles where y-1 is a wall
+        local possibleTerminals = {}
+        for y = room.y, room.y + room.h - 1 do
+            for x = room.x, room.x + room.w - 1 do
+                if util.tileAt(x, y) == 0 and util.tileAt(x, y - 1) == 1 then
+                    table.insert(possibleTerminals, {x=x, y=y})
+                end
+            end
+        end
+
+        if #possibleTerminals > 0 and rand() < 0.3 then
+            local pos = possibleTerminals[rand(1, #possibleTerminals)]
+            local txt, corr = getContent()
+            items[#items+1] = {
+                x = pos.x,
+                y = pos.y,
+                type = "terminal",
+                spriteKey = "terminal",
+                content = txt,
+                isCorrupted = corr
+            }
+        end
+
+        -- Standard Loot
+        if rand() < 0.35 then
+            items[#items+1] = {
+                x = rand(room.x, room.x + room.w - 1),
+                y = rand(room.y, room.y + room.h - 1),
+                type = "supply",
+                spriteKey = "supply",
+                amount = rand(2, 6) + game.sector,
+            }
+        end
+        if rand() < 0.2 then
+            items[#items+1] = {
+                x = rand(room.x, room.x + room.w - 1),
+                y = rand(room.y, room.y + room.h - 1),
+                type = "medkit",
+                spriteKey = "medkit",
+            }
+        end
+        if rand() < 0.15 and player.cells < player.cellsNeeded then
+            items[#items+1] = {
+                x = rand(room.x, room.x + room.w - 1),
+                y = rand(room.y, room.y + room.h - 1),
+                type = "cell",
+                spriteKey = "cell",
+            }
+        end
+        if rand() < 0.2 then
+            items[#items+1] = {
+                x = rand(room.x, room.x + room.w - 1),
+                y = rand(room.y, room.y + room.h - 1),
+                type = "oxygen",
+                spriteKey = "oxygen",
+            }
+        end
+        if game.sector >= 2 and rand() < 0.12 then
+            items[#items+1] = {
+                x = rand(room.x, room.x + room.w - 1),
+                y = rand(room.y, room.y + room.h - 1),
+                type = "keycard",
+                spriteKey = "keycard",
+            }
+        end
+    end
+end
+
+return M 
+==== FILE END ==== 
+ 
+==== FILE START MindMarr.lua ==== 
+-- MindMarr.lua
+-- MINDMARR: Mars Becomes Mind
+-- d100 Roll-Under Survival Horror — Escape the sentient planet
+-- Arrow keys move, bump-to-attack, collect supplies, reach the shuttle
+-- Say "MINDMARR" and it's the last word you ever say
+
+local root = UIElement:new({width=800, height=600})
+
+local W, H = 800, 600
+local max = math.max
+
+-- Load modules
+local state = require("state")
+local K = require("constants")
+local util = require("util")
+local combat = require("combat")
+local actions = require("actions")
+local draw = require("draw")
+
+local game = state.game
+local player = state.player
+
+-- Input
+local function keyPressed(key)
+    if not bridge.getKeyState then return false end
+    local down = bridge.getKeyState(key) == 1
+    local was = game.keyWasDown[key] or false
+    game.keyWasDown[key] = down
+    return down and not was
+end
+
+-- Main update
+function UpdateUI(mx, my, down, w, h)
+    W, H = w, h
+    root.width = w
+    root.height = h
+    draw.setSize(w, h)
+    local dt = 0.016
+
+    game.pulseTimer = game.pulseTimer + dt
+
+    if game.shakeTimer > 0 then
+        game.shakeTimer = game.shakeTimer - dt
+    end
+
+    -- Particles
+    for i = #game.particles, 1, -1 do
+        local p = game.particles[i]
+        p.x = p.x + p.vx * dt
+        p.y = p.y + p.vy * dt
+        p.life = p.life - dt
+        p.vx = p.vx * 0.95
+        p.vy = p.vy * 0.95
+        if p.life <= 0 then table.remove(game.particles, i) end
+    end
+
+    for _, msg in ipairs(game.messages) do
+        msg.age = msg.age + dt
+    end
+
+    -- Animate enemies every render frame
+    for _, e in ipairs(state.enemies) do
+        if e.alive and e.frameCount and e.frameCount > 1 then
+            e.animTimer = (e.animTimer or 0) + dt
+            local frameTime = 1.0 / (e.animFPS or 5)
+            if e.animTimer >= frameTime then
+                e.animTimer = e.animTimer - frameTime
+                if e.animState == "attack" then
+                    e.currentFrame = e.currentFrame + 1
+                    if e.currentFrame > e.frameCount then
+                        e.animState = "idle"
+                        e.currentFrame = 1
+                    end
+                else
+                    -- Idle: alternate frame 1 and 2
+                    e.currentFrame = (e.currentFrame == 1) and 2 or 1
+                end
+            end
+        end
+    end
+
+    -- Title
+    if game.state == "title" then
+        if keyPressed("space") then actions.resetGame() end
+        return
+    end
+
+    -- Dead / mindmarr / won
+    if game.state == "dead" or game.state == "mindmarr" or game.state == "won" then
+        if keyPressed("space") then actions.resetGame() end
+        return
+    end
+
+    -- Level up
+    if game.state == "levelup" then
+        for i = 1, #K.levelChoices do
+            if keyPressed(tostring(i)) then
+                actions.applyLevelChoice(i)
+                break
+            end
+        end
+        return
+    end
+
+    -- Interaction Menu (Document/Terminal)
+    if game.state == "interacting" then
+        if keyPressed("1") then
+            actions.resolveInteraction(1)
+        elseif keyPressed("2") then
+            actions.resolveInteraction(2)
+        end
+        return
+    end
+
+    -- Playing
+    game.inputCooldown = max(0, game.inputCooldown - dt)
+
+    if game.state == "playing" then
+        if keyPressed("up") or keyPressed("w") then actions.tryMove(0, -1)
+        elseif keyPressed("down") or keyPressed("s") then actions.tryMove(0, 1)
+        elseif keyPressed("left") or keyPressed("a") then actions.tryMove(-1, 0)
+        elseif keyPressed("right") or keyPressed("d") then actions.tryMove(1, 0)
+        elseif keyPressed("m") then actions.useMedkit()
+        end
+    end
+end
+
+function DrawUI()
+    draw.drawGame()
+end 
+==== FILE END ==== 
+ 
+==== FILE START state.lua ==== 
+-- state.lua
+-- MINDMARR: Shared mutable game state
+
+local game = {
+    state = "title",
+    sector = 1,
+    maxSectors = 7,
+    turn = 0,
+    messages = {},
+    maxMessages = 6,
+    shakeTimer = 0,
+    shakeIntensity = 0,
+    particles = {},
+    camX = 0, camY = 0,
+    inputCooldown = 0,
+    keyWasDown = {},
+    marsWhisperTimer = 0,
+    pulseTimer = 0,
+    won = false,
+    
+    -- New: Tracks the item the player is currently deciding on
+    interaction = {
+        active = false,
+        type = nil,       -- "scattered_document" or "terminal"
+        itemIndex = nil,  -- Index in items table
+        content = "",     -- Text to display if read
+        isCorrupted = false
+    }
+}
+
+local player = {
+    x = 0, y = 0,
+    hp = 30, maxHp = 30,
+    str = 55,
+    def = 40,
+    dmgMin = 2, dmgMax = 5,
+    armor = 0,
+    xp = 0,
+    xpNext = 20,
+    level = 1,
+    sanity = 100,
+    oxygen = 100,
+    medkits = 1,
+    cells = 0,
+    cellsNeeded = 3,
+    kills = 0,
+    critBonus = 5,
+    seen = {},
+    keycards = 0,
+}
+
+local map = {}
+local enemies = {}
+local items = {}
+local shuttle = {x = 0, y = 0}
+local elevator = {x = 0, y = 0, revealed = false}
+
+return {
+    game = game,
+    player = player,
+    map = map,
+    enemies = enemies,
+    items = items,
+    shuttle = shuttle,
+    elevator = elevator,
+} 
+==== FILE END ==== 
+ 
+==== FILE START terminals.lua ==== 
+-- MINDMARR Terminal Database
+-- Add new entries here. C engine can request these by ID.
+
+terminals = {
+    [1] = {
+        title = "LAB_LOG_01",
+        is_corrupted = false,
+        sanity_gain = 10,
+        content = [[
+Subject reports strange vibrations in the sub-floor. 
+Initial scans show no seismic activity. 
+It feels less like an earthquake and more like... 
+a heartbeat.]]
+    },
+
+    [2] = {
+        title = "SECURITY_FEED_SEC3",
+        is_corrupted = true,
+        sanity_gain = -5, -- Reading this HURTS your mind
+        content = [[
+ENTRY 404: 
+Everything is red. 
+Why is everyone so quiet? 
+I tried to ask for help but I can only say it.
+MINDMARR
+MINDMARR
+MINDMARR
+MINDMARR]]
+    },
+
+    [3] = {
+        title = "RECOVERY_PLANS",
+        is_corrupted = false,
+        sanity_gain = 15,
+        content = [[
+The escape shuttle is fueled. 
+We just need the keycard from Sector 7. 
+If you are reading this, don't listen to the wind. 
+Keep your helmet sealed. Stay sane. You must not repeat what they say!]]
+    },
+
+        [4] = {
+        title = "CAPTAIN'S_LOG",
+        is_corrupted = true,
+        sanity_gain = -5,
+        content = [[
+Captain's Log: 145
+It was supposed to be a standard operation.
+Then we began to hear the noises from down below, once we decoded
+the signal we began to lose contact with different sectors quickly.
+Once the radio began repeating itself from various people all saying the same word
+it was followed by a silence, and an echoing name in the halls.
+It appears they are trying to warn us or tell us about something called
+Mindmarr.... miiinnnddddmmaaarrrr .... MiinDDMMAARRR MINDMAARRRRR 
+Keep your helmet sealed. Stay sane. You must not repeat what they say!]]
+    }
+}
+
+-- Simple helper function for your C backend to call
+function get_terminal(id)
+    return terminals[id] or nil
+end 
+==== FILE END ==== 
+ 
+==== FILE START util.lua ==== 
+-- util.lua
+-- MINDMARR: Utility functions
+
+local sin, cos, rand, floor = math.sin, math.cos, math.random, math.floor
+local abs, sqrt, max, min = math.abs, math.sqrt, math.max, math.min
+
+local state = require("state")
+local K = require("constants")
+
+local game = state.game
+local player = state.player
+
+local M = {}
+
+function M.spawnParticles(x, y, count, r, g, b, speed, life)
+    for i = 1, count do
+        local a = rand() * math.pi * 2
+        local s = rand() * speed + speed * 0.2
+        game.particles[#game.particles+1] = {
+            x = x, y = y,
+            vx = cos(a) * s, vy = sin(a) * s,
+            life = life * (0.4 + rand() * 0.6),
+            maxLife = life,
+            r = r, g = g, b = b,
+            -- UPDATED: Scale particles based on Tile Size (approx 10-15% of a tile)
+            size = rand() < 0.3 and (K.TS * 0.15) or (K.TS * 0.1),
+        }
+    end
+end
+
+function M.screenShake(intensity, duration)
+    game.shakeTimer = duration
+    game.shakeIntensity = intensity
+end
+
+function M.addMessage(text, r, g, b)
+    table.insert(game.messages, 1, {text = text, r = r or 200, g = g or 200, b = b or 200, age = 0})
+    if #game.messages > game.maxMessages then
+        table.remove(game.messages)
+    end
+end
+
+function M.d100()
+    return rand(1, 100)
+end
+
+-- FOV
+function M.computeFOV()
+    local radius = 6
+    for a = 0, 359, 2 do
+        local rad = a * math.pi / 180
+        local dx = cos(rad)
+        local dy = sin(rad)
+        local fx, fy = player.x + 0.5, player.y + 0.5
+        for d = 0, radius do
+            local tx, ty = floor(fx), floor(fy)
+            if tx < 1 or tx > K.MW or ty < 1 or ty > K.MH then break end
+            player.seen[ty * 1000 + tx] = 2
+            if M.tileAt(tx, ty) == 1 then break end
+            fx = fx + dx * 0.5
+            fy = fy + dy * 0.5
+        end
+    end
+end
+
+function M.dimFOV()
+    for k, v in pairs(player.seen) do
+        if v == 2 then player.seen[k] = 1 end
+    end
+end
+
+function M.isVisible(x, y)
+    return (player.seen[y * 1000 + x] or 0) == 2
+end
+
+function M.isSeen(x, y)
+    return (player.seen[y * 1000 + x] or 0) >= 1
+end
+
+-- Tile helpers (need map access)
+function M.tileAt(x, y)
+    if x < 1 or x > K.MW or y < 1 or y > K.MH then return 1 end
+    return state.map[y][x]
+end
+
+function M.setTile(x, y, v)
+    if x >= 1 and x <= K.MW and y >= 1 and y <= K.MH then
+        state.map[y][x] = v
+    end
+end
+
+function M.enemyAt(x, y)
+    for _, e in ipairs(state.enemies) do
+        if e.alive and e.x == x and e.y == y then return e end
+    end
+    return nil
+end
+
+-- Mars whisper
+function M.marsWhisper()
+    if player.sanity > 0 then
+        local drain = rand(1, 3)
+        player.sanity = max(0, player.sanity - drain)
+        local w = K.marsWhispers[rand(1, #K.marsWhispers)]
+        M.addMessage(w, K.C.whisper[1], K.C.whisper[2], K.C.whisper[3])
+        if player.sanity <= 0 then
+            game.state = "mindmarr"
+            M.addMessage("Your lips move on their own...", 255, 40, 60)
+            M.addMessage("You whisper: \"mindmarr\"", 255, 20, 40)
+            M.addMessage("It's the last word you ever say.", 255, 0, 0)
+            M.screenShake(10, 0.6)
+            M.spawnParticles(player.x * K.TS + K.TS/2, player.y * K.TS + K.TS/2, 50, 200, 30, 60, 150, 1.2)
+        end
+    end
+end
+
+return M 
+==== FILE END ==== 
+ 

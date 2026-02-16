@@ -1,0 +1,200 @@
+-- ============================================================
+-- oak_forest.marble -- MarbleScript v0.1
+--
+-- The first .marble file. This is the source-of-truth for the
+-- Oak Forest demo scenario. Currently hand-compiled to C
+-- (see main.c). Phase 1+ will parse this and codegen the
+-- equivalent C structs, enums, and lookup tables automatically.
+--
+-- To verify: the C runtime output with WORLD_SEED=42 must
+-- produce identical results on all platforms (deterministic
+-- SplitMix32 PRNG).
+-- ============================================================
+
+world "Oak Forest Demo" {
+    max_entities     1024
+    tick_interval_ms 600
+    seed             42
+    max_layers       4
+    max_body_parts   6
+    max_skills       8
+}
+
+-- ============================================================
+-- MATERIALS
+-- Physical constants. Hardness is on a 0-100 scale.
+-- ============================================================
+
+material Wood  { hardness 30 }
+material Iron  { hardness 80 }
+material Flesh { hardness 10 }
+material Bark  { hardness 25 }
+material Bone  { hardness 40 }
+
+-- ============================================================
+-- LAYER TEMPLATES
+-- Ordered outside-in. Index 0 = outermost layer.
+-- ============================================================
+
+layer OakTree {
+    Bark  integrity 3
+    Wood  integrity 10
+}
+
+layer HumanHand {
+    Flesh integrity 1
+    Bone  integrity 1
+}
+
+-- ============================================================
+-- SKILLS
+-- Named identifiers for the d100 roll system.
+-- ============================================================
+
+skill Woodcutting
+
+-- ============================================================
+-- ANATOMY & BODY PARTS
+-- Anatomy = flags for gross body structure.
+-- Body parts = named slots referencing sub-entities.
+-- ============================================================
+
+anatomy Arms
+anatomy Hands
+anatomy Legs
+
+bodypart RightHand
+
+-- ============================================================
+-- CONDITIONS
+-- Reusable predicate atoms. These are NOT executable code --
+-- they compile to cases in the C evaluate_condition() switch.
+-- ============================================================
+
+condition tool_harder_than_layer {
+    check Actor.Tool.Material.Hardness > Target.Layer[0].Material.Hardness
+}
+
+-- ============================================================
+-- EFFECTS
+-- State mutations applied on interaction success or crit fail.
+-- Compile to cases in the C apply_effect() switch.
+-- ============================================================
+
+effect damage_layer {
+    apply Target.Layer[0].integrity -= 1
+}
+
+-- ============================================================
+-- CAPABILITIES (Actor-side)
+-- "What can this entity DO?"
+--
+-- The BodyPart.RightHand.integrity requirement is the
+-- fine motor gate: if the hand is destroyed, this condition
+-- fails declaratively and the capability is effectively lost
+-- without any imperative flag mutation.
+-- ============================================================
+
+capability Chop {
+    require   Anatomy.Arms
+    require   Anatomy.Hands
+    require   BodyPart.RightHand.integrity > 0
+    skill     Woodcutting
+    min_skill 1
+}
+
+-- ============================================================
+-- AFFORDANCES (Object-side)
+-- "What can be DONE TO this entity?"
+--
+-- crit_fail fields define what happens when the d100 roll
+-- falls below the crit threshold: the actor damages their
+-- own body part. This is how the lumberjack hurts their hand.
+-- ============================================================
+
+affordance Choppable {
+    require_cap         Chop
+    condition           tool_harder_than_layer
+    on_success          damage_layer
+    difficulty          40
+    crit_fail_threshold 15
+    crit_fail_bodypart  RightHand
+    crit_fail_damage    2
+}
+
+-- ============================================================
+-- VERBS
+-- The bridge between capability and affordance.
+-- An actor submits (actor, target, verb) to the processor.
+-- ============================================================
+
+verb Chop {
+    actor_cap  Chop
+    target_aff Choppable
+}
+
+-- ============================================================
+-- SYSTEMS
+-- Tick-driven processors. Frequency = run every N ticks.
+-- ============================================================
+
+system TickLog {
+    frequency 1
+}
+
+system InteractionProcessor {
+    frequency 2
+    requires  Capabilities, Affordances, Anatomy, Skills, Tool, BodyParts, Layers
+}
+
+system WorldStatus {
+    frequency 3
+}
+
+-- ============================================================
+-- RULES
+-- Multi-effect interaction definitions using the command buffer.
+-- TRIGGER = which verb activates this rule
+-- REQ = which capability the actor needs
+-- COND = conditions that must pass (can have multiple)
+-- DIFFICULTY = d100 threshold
+-- CRIT_FAIL = what happens on critical failure
+-- EFFECT = commands emitted on success (ordered)
+-- ============================================================
+
+rule Rule_Chop {
+    trigger         Chop
+    require_cap     Chop
+    condition       tool_harder_than_layer
+    difficulty      40
+    crit_fail_threshold 15
+    crit_fail_bodypart  RightHand
+    crit_fail_damage    2
+    effect DAMAGE_LAYER target:target amount:1
+}
+
+-- ============================================================
+-- ENTITIES
+-- World population. Each entity is a bag of components.
+-- @references resolve to other entity IDs at init time.
+-- ============================================================
+
+entity Lumberjack {
+    Health       { hp 100, max_hp 100 }
+    Position     { x 5.0, y 3.0 }
+    Anatomy      { Arms, Hands, Legs }
+    Skills       { Woodcutting 60 }
+    Capabilities { Chop }
+    Tool         { material Iron }
+    BodyParts    { RightHand -> @LumberjackHand }
+}
+
+entity LumberjackHand {
+    Layers template HumanHand
+}
+
+entity OakTree {
+    Position     { x 6.0, y 3.0 }
+    Layers       template OakTree
+    Affordances  { Choppable }
+}
